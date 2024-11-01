@@ -100,24 +100,24 @@ Consider this example where 100 screws are added to an assembly:
 
 .. code::
 
-    screw = Compound.import_step("M6-1x12-countersunk-screw.step")
+    screw = import_step("M6-1x12-countersunk-screw.step")
     locs = HexLocations(6, 10, 10).local_locations
 
     screw_copies = [copy.deepcopy(screw).locate(loc) for loc in locs]
     copy_assembly = Compound(children=screw_copies)
-    copy_assembly.export_step("copy_assembly.step")
+    export_step(copy_assembly, "copy_assembly.step")
 
 which takes about 5 seconds to run (on an older computer) and produces
 a file of size 51938 KB. However, if a shallow copy is used instead:
 
 .. code::
 
-    screw = Compound.import_step("M6-1x12-countersunk-screw.step")
+    screw = import_step("M6-1x12-countersunk-screw.step")
     locs = HexLocations(6, 10, 10).local_locations
 
     screw_references = [copy.copy(screw).locate(loc) for loc in locs]
     reference_assembly = Compound(children=screw_references)
-    reference_assembly.export_step("reference_assembly.step")
+    export_step(reference_assembly, "reference_assembly.step")
 
 this takes about ¼ second and produces a file of size 550 KB - just over
 1% of the size of the ``deepcopy()`` version and only 12% larger than the
@@ -159,6 +159,28 @@ adds the following attributes to :class:`~topology.Shape`:
     object, the ``children`` attribute will have to be reassigned.
 
     .. _pack:
+
+************************
+Iterating Over Compounds
+************************
+
+As Compounds are containers for shapes, build123d can iterate over these as required.
+Complex nested assemblies (compounds within compounds) do not need to be looped over with recursive functions.
+In the example below, the variable total_volume holds the sum of all the volumes in each solid in an assembly.
+Compare this to assembly3_volume which only results in the volume of the top level part.
+
+.. code:: python
+
+    # [import]
+    from build123d import *
+    from ocp_vscode import *
+
+    # Each assembly has a box and the previous assembly.
+    assembly1 = Compound(label='Assembly1', children=[Box(1, 1, 1),])
+    assembly2 = Compound(label='Assembly2', children=[assembly1, Box(1, 1, 1)])
+    assembly3 = Compound(label='Assembly3', children=[assembly2, Box(1, 1, 1)])
+    total_volume = sum(part.volume for part in assembly3.solids()) # 3
+    assembly3_volume = assembly3.volume # 1 
 
 ******
 pack

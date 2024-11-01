@@ -404,7 +404,7 @@ def project_workplane(
     # Project a point off the origin to find the projected x direction
     screen = Face.make_rect(1e9, 1e9, plane=workplane)
     x_dir_point_axis = Axis(origin + x_dir, projection_dir)
-    projection = screen.find_intersection(x_dir_point_axis)
+    projection = screen.find_intersection_points(x_dir_point_axis)
     if not projection:
         raise ValueError("x_dir perpendicular to projection_dir")
 
@@ -496,9 +496,9 @@ def section(
     validate_inputs(context, "section", None)
 
     if context is not None and obj is None:
-        max_size = context.part.bounding_box().diagonal
+        max_size = context.part.bounding_box(optimal=False).diagonal
     else:
-        max_size = obj.bounding_box().diagonal
+        max_size = obj.bounding_box(optimal=False).diagonal
 
     if section_by is not None:
         section_planes = (
@@ -592,12 +592,12 @@ def thicken(
     logger.info("%d face(s) to thicken", len(to_thicken_faces))
 
     for face in to_thicken_faces:
-        normal_override = (
+        face_normal = (
             normal_override if normal_override is not None else face.normal_at()
         )
         for direction in [1, -1] if both else [1]:
             new_solids.append(
-                face.thicken(depth=amount, normal_override=normal_override * direction)
+                face.thicken(depth=amount, normal_override=face_normal * direction)
             )
 
     if context is not None:

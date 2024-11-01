@@ -521,6 +521,13 @@ class OffsetTests(unittest.TestCase):
             offset(amount=1, kind=Kind.INTERSECTION)
         self.assertAlmostEqual(test.sketch.area, 9, 5)
 
+    def test_face_offset_with_holes(self):
+        sk = Rectangle(100, 100) - GridLocations(80, 80, 2, 2) * Circle(5)
+        sk2 = offset(sk, -5)
+        self.assertTrue(sk2.face().is_valid())
+        self.assertLess(sk2.area, sk.area)
+        self.assertEqual(len(sk2), 1)
+
     def test_box_offset(self):
         with BuildPart() as test:
             Box(10, 10, 10)
@@ -755,11 +762,19 @@ class ScaleTests(unittest.TestCase):
             scale(line, 2)
         self.assertAlmostEqual(test.edges()[0].length, 2.0, 5)
 
+    def test_wrapping(self):
+        skt = Sketch() + GridLocations(10, 10, 2, 2) * Rectangle(1, 1)
+        skt2 = scale(skt, 2)  # unwrap is called here
+        self.assertEqual(len(skt2), 4)
+        self.assertAlmostEqual(skt2.area, 4 * 2 * 2, 5)
+
     def test_error_checking(self):
         with self.assertRaises(ValueError):
             with BuildPart():
                 Box(1, 1, 1)
                 scale(by="a")
+        with self.assertRaises(ValueError):
+            scale(by=2)
 
 
 class TestSweep(unittest.TestCase):

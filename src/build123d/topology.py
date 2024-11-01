@@ -44,7 +44,7 @@ import warnings
 from abc import ABC, ABCMeta, abstractmethod
 from io import BytesIO
 from itertools import combinations
-from math import radians, inf, pi, sin, cos, tan, copysign, ceil, floor
+from math import radians, inf, pi, sin, cos, tan, copysign, ceil, floor, isclose
 from typing import (
     Any,
     Callable,
@@ -65,6 +65,8 @@ from typing_extensions import Self, Literal, deprecated
 
 from anytree import NodeMixin, PreOrderIter, RenderTree
 from IPython.lib.pretty import pretty
+from numpy import ndarray
+from scipy.optimize import minimize
 from scipy.spatial import ConvexHull
 from vtkmodules.vtkCommonDataModel import vtkPolyData
 from vtkmodules.vtkFiltersCore import vtkPolyDataNormals, vtkTriangleFilter
@@ -86,6 +88,7 @@ from OCP.BRepAlgoAPI import (
     BRepAlgoAPI_Common,
     BRepAlgoAPI_Cut,
     BRepAlgoAPI_Fuse,
+    BRepAlgoAPI_Section,
     BRepAlgoAPI_Splitter,
 )
 from OCP.BRepBuilderAPI import (
@@ -443,7 +446,7 @@ class Mixin1D:
             if position_mode == PositionMode.PARAMETER:
                 parameter = self.param_at(position)
             else:
-                parameter = position
+                parameter = self.param_at(position / self.length)
         else:
             try:
                 pnt = Vector(position)
@@ -584,9 +587,10 @@ class Mixin1D:
             # Shorten any infinite lines (from converted Axis)
             normal_lines = list(filter(lambda line: line.length <= 1e50, all_lines))
             infinite_lines = filter(lambda line: line.length > 1e50, all_lines)
-            shortened_lines = [
-                l.trim(0.4999999999, 0.5000000001) for l in infinite_lines
-            ]
+            # shortened_lines = [
+            #     l.trim(0.4999999999, 0.5000000001) for l in infinite_lines
+            # ]
+            shortened_lines = [l.trim_to_length(0.5, 10) for l in infinite_lines]
             all_lines = normal_lines + shortened_lines
 
             for line in all_lines:
@@ -680,7 +684,7 @@ class Mixin1D:
         if position_mode == PositionMode.PARAMETER:
             param = self.param_at(distance)
         else:
-            param = distance
+            param = self.param_at(distance / self.length)
 
         return Vector(curve.Value(param))
 
@@ -731,7 +735,7 @@ class Mixin1D:
         if position_mode == PositionMode.PARAMETER:
             param = self.param_at(distance)
         else:
-            param = distance
+            param = self.param_at(distance / self.length)
 
         law: GeomFill_TrihedronLaw
         if frame_method == FrameMethod.FRENET:
@@ -1476,6 +1480,30 @@ class Shape(NodeMixin):
         """Set the shape's color"""
         self._color = value
 
+    def copy_attributes_to(self, target: Shape, attributes: list[str]):
+        """Copy object attributes to target
+
+        Args:
+            target (Shape): object to gain attributes
+            attributes (list[str]): attributes to copy
+
+        Raises:
+            ValueError: invalid attribute
+        """
+        for attr in attributes:
+            # Check if both 'self' and 'target' have the attribute
+            if hasattr(self, attr):
+                if hasattr(target, attr):
+                    # Copy the attribute only if the target's attribute not set
+                    if not getattr(target, attr):
+                        setattr(target, attr, getattr(self, attr))
+                elif getattr(self, attr):
+                    warnings.warn(
+                        f"Target does not have attribute '{attr}', skipping copy."
+                    )
+            else:
+                raise ValueError(f"Source does not have attribute '{attr}'")
+
     @property
     def is_manifold(self) -> bool:
         """is_manifold
@@ -1970,7 +1998,7 @@ class Shape(NodeMixin):
 
     def __eq__(self, other) -> bool:
         """Are shapes same operator =="""
-        return self.is_same(other) if isinstance(other, Shape) else False
+        return self.is_same(other) if isinstance(other, Shape) else NotImplemented
 
     def is_valid(self) -> bool:
         """Returns True if no defect is detected on the shape S or any of its
@@ -1986,7 +2014,7 @@ class Shape(NodeMixin):
         chk.SetParallel(True)
         return chk.IsValid()
 
-    def bounding_box(self, tolerance: float = None) -> BoundBox:
+    def bounding_box(self, tolerance: float = None, optimal: bool = True) -> BoundBox:
         """Create a bounding box for this Shape.
 
         Args:
@@ -1995,7 +2023,9 @@ class Shape(NodeMixin):
         Returns:
             BoundBox: A box sized to contain this Shape
         """
-        return BoundBox._from_topo_ds(self.wrapped, tolerance=tolerance)
+        return BoundBox._from_topo_ds(
+            self.wrapped, tolerance=tolerance, optimal=optimal
+        )
 
     def mirror(self, mirror_plane: Plane = None) -> Self:
         """
@@ -2310,7 +2340,8 @@ class Shape(NodeMixin):
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
-        memo[id(self.wrapped)] = downcast(BRepBuilderAPI_Copy(self.wrapped).Shape())
+        if self.wrapped is not None:
+            memo[id(self.wrapped)] = downcast(BRepBuilderAPI_Copy(self.wrapped).Shape())
         for key, value in self.__dict__.items():
             setattr(result, key, copy.deepcopy(value, memo))
             if key == "joints":
@@ -2568,6 +2599,14 @@ class Shape(NodeMixin):
 
         return return_value
 
+    def _intersect_with_axis(self, *axes: Axis) -> Shape:
+        lines = [Edge(a) for a in axes]
+        return self.intersect(*lines)
+
+    def _intersect_with_plane(self, *planes: Plane) -> Shape:
+        surfaces = [Face.make_plane(p) for p in planes]
+        return self.intersect(*surfaces)
+
     def intersect(self, *to_intersect: Union[Shape, Axis, Plane]) -> Shape:
         """Intersection of the arguments and this shape
 
@@ -2578,93 +2617,76 @@ class Shape(NodeMixin):
         Returns:
             Shape: Resulting object may be of a different class than self
         """
-        # pylint: disable=too-many-branches
 
-        # def ocp_section(this: Shape, that: Shape) -> (list[Vertex], list[Edge]):
-        #     # Create a BRepAlgoAPI_Section object
-        #     try:
-        #         section = BRepAlgoAPI_Section(that._geom_adaptor(), this.wrapped)
-        #     except (TypeError, AttributeError):
-        #         try:
-        #             section = BRepAlgoAPI_Section(this._geom_adaptor(), that.wrapped)
-        #         except (TypeError, AttributeError):
-        #             return ([], [])
-
-        #     # Perform the intersection calculation
-        #     section.Build()
-
-        #     # Get the resulting shapes from the intersection
-        #     intersectionShape = section.Shape()
-
-        #     vertices = []
-        #     # Iterate through the intersection shape to find intersection points/edges
-        #     explorer = TopExp_Explorer(
-        #         intersectionShape, TopAbs_ShapeEnum.TopAbs_VERTEX
-        #     )
-        #     while explorer.More():
-        #         vertices.append(Vertex(downcast(explorer.Current())))
-        #         explorer.Next()
-        #     edges = []
-        #     explorer = TopExp_Explorer(intersectionShape, TopAbs_ShapeEnum.TopAbs_EDGE)
-        #     while explorer.More():
-        #         edges.append(Edge(downcast(explorer.Current())))
-        #         explorer.Next()
-
-        #     return (vertices, edges)
-
-        vertex_intersections = []
-        edge_intersections = []
-
-        # Convert geometry intersectors to topology intersectors
-        intersectors = []
-        for intersector in to_intersect:
-            if isinstance(intersector, Axis):
-                intersectors.append(intersector.as_infinite_edge())
-                intersections = [
-                    Vertex(*pnt.to_tuple())
-                    for pnt, _normal in self.find_intersection(intersector)
-                ]
-                vertex_intersections.extend(intersections)
-            elif isinstance(intersector, Plane):
-                intersectors.append(Face.make_plane(intersector))
+        # Convert any geometry objects into their respective topology objects
+        objs = []
+        for obj in to_intersect:
+            if isinstance(obj, Vector):
+                objs.append(Vertex(obj))
+            elif isinstance(obj, Axis):
+                objs.append(Edge(obj))
+            elif isinstance(obj, Plane):
+                objs.append(Face.make_plane(obj))
+            elif isinstance(obj, Location):
+                objs.append(Vertex(obj.position))
             else:
-                intersectors.append(intersector)
+                objs.append(obj)
 
-        # Find the shape intersections, including Edge/Edge overlaps
+        # Find the shape intersections
         intersect_op = BRepAlgoAPI_Common()
-        shape_intersections = self._bool_op((self,), intersectors, intersect_op)
-
-        # Find the ocp section intersections
-        # for intersector in intersectors:
-        #     vertices, edges = ocp_section(self, intersector)
-        #     vertex_intersections.extend(vertices)
-        #     edge_intersections.extend(edges)
-
-        # Find the vertices from Edge/Edge intersections on a common Plane
-        if all([isinstance(obj, (Edge, Wire)) for obj in [self] + intersectors]):
-            all_edges = [e for obj in [self] + intersectors for e in obj.edges()]
-            common_plane = all_edges[0].common_plane(*all_edges[1:])
-            if common_plane is not None:
-                for edge0, edge1 in combinations(all_edges, 2):
-                    vertex_intersections.extend(
-                        Vertex(*v.to_tuple()) for v in edge0.intersections(edge1)
-                    )
-
-        if vertex_intersections:
-            if shape_intersections.is_null():
-                shape_intersections = vertex_intersections.pop().fuse(
-                    *vertex_intersections
-                )
-            else:
-                shape_intersections = shape_intersections.fuse(*vertex_intersections)
-
-        if edge_intersections:
-            if shape_intersections.is_null():
-                shape_intersections = edge_intersections.pop().fuse(*edge_intersections)
-            else:
-                shape_intersections = shape_intersections.fuse(*edge_intersections)
+        shape_intersections = self._bool_op((self,), objs, intersect_op)
 
         return shape_intersections
+
+    def _ocp_section(
+        self: Shape, other: Union[Vertex, Edge, Wire, Face]
+    ) -> tuple[list[Vertex], list[Edge]]:
+        """_ocp_section
+
+        Create a BRepAlgoAPI_Section object
+
+        The algorithm is to build a Section operation between arguments and tools.
+        The result of Section operation consists of vertices and edges. The result
+        of Section operation contains:
+        - new vertices that are subjects of V/V, E/E, E/F, F/F interferences
+        - vertices that are subjects of V/E, V/F interferences
+        - new edges that are subjects of F/F interferences
+        - edges that are Common Blocks
+
+
+        Args:
+            other (Union[Vertex, Edge, Wire, Face]): shape to section with
+
+        Returns:
+            tuple[list[Vertex], list[Edge]]: section results
+        """
+        try:
+            section = BRepAlgoAPI_Section(other._geom_adaptor(), self.wrapped)
+        except (TypeError, AttributeError):
+            try:
+                section = BRepAlgoAPI_Section(self._geom_adaptor(), other.wrapped)
+            except (TypeError, AttributeError):
+                return ([], [])
+
+        # Perform the intersection calculation
+        section.Build()
+
+        # Get the resulting shapes from the intersection
+        intersectionShape = section.Shape()
+
+        vertices = []
+        # Iterate through the intersection shape to find intersection points/edges
+        explorer = TopExp_Explorer(intersectionShape, TopAbs_ShapeEnum.TopAbs_VERTEX)
+        while explorer.More():
+            vertices.append(Vertex(downcast(explorer.Current())))
+            explorer.Next()
+        edges = []
+        explorer = TopExp_Explorer(intersectionShape, TopAbs_ShapeEnum.TopAbs_EDGE)
+        while explorer.More():
+            edges.append(Edge(downcast(explorer.Current())))
+            explorer.Next()
+
+        return (vertices, edges)
 
     def faces_intersected_by_axis(
         self,
@@ -2708,13 +2730,13 @@ class Shape(NodeMixin):
 
         return ShapeList([Face(face) for face in faces])
 
-    def split(self, plane: Plane, keep: Keep = Keep.TOP) -> Self:
+    def split(self, surface: Union[Plane, Face], keep: Keep = Keep.TOP) -> Self:
         """split
 
-        Split this shape by the provided plane.
+        Split this shape by the provided plane or face.
 
         Args:
-            plane (Plane): plane to segment shape
+            surface (Union[Plane,Face]): surface to segment shape
             keep (Keep, optional): which object(s) to save. Defaults to Keep.TOP.
 
         Returns:
@@ -2723,8 +2745,12 @@ class Shape(NodeMixin):
         shape_list = TopTools_ListOfShape()
         shape_list.Append(self.wrapped)
 
-        # Define the splitting plane
-        tool = Face.make_plane(plane).wrapped
+        # Define the splitting tool
+        tool = (
+            Face.make_plane(surface).wrapped
+            if isinstance(surface, Plane)
+            else surface.wrapped
+        )
         tool_list = TopTools_ListOfShape()
         tool_list.Append(tool)
 
@@ -2738,28 +2764,118 @@ class Shape(NodeMixin):
         # Perform the splitting operation
         splitter.Build()
 
+        result = Compound(downcast(splitter.Shape())).unwrap(fully=False)
+        if keep != Keep.BOTH:
+            if not isinstance(surface, Plane):
+                # Create solids from the surfaces for sorting
+                surface_up = surface.thicken(0.1)
+            tops, bottoms = [], []
+            for part in result:
+                if isinstance(surface, Plane):
+                    is_up = surface.to_local_coords(part).center().Z >= 0
+                else:
+                    is_up = surface_up.intersect(part).volume >= TOLERANCE
+                (tops if is_up else bottoms).append(part)
+            result = Compound(tops) if keep == Keep.TOP else Compound(bottoms)
+
+        return result.unwrap(fully=True)
+
+    @overload
+    def split_by_perimeter(
+        self, perimeter: Union[Edge, Wire], keep: Literal[Keep.INSIDE, Keep.OUTSIDE]
+    ) -> Union[Optional[Shell], Optional[Face]]: ...
+
+    @overload
+    def split_by_perimeter(
+        self, perimeter: Union[Edge, Wire], keep: Literal[Keep.BOTH]
+    ) -> tuple[
+        Union[Optional[Shell], Optional[Face]],
+        Union[Optional[Shell], Optional[Face]],
+    ]: ...
+    @overload
+    def split_by_perimeter(
+        self, perimeter: Union[Edge, Wire]
+    ) -> Union[Optional[Shell], Optional[Face]]: ...
+    def split_by_perimeter(
+        self, perimeter: Union[Edge, Wire], keep: Keep = Keep.INSIDE
+    ):
+        """split_by_perimeter
+
+        Divide the faces of this object into those within the perimeter
+        and those outside the perimeter.
+
+        Note: this method may fail if the perimeter intersects shape edges.
+
+        Args:
+            perimeter (Union[Edge,Wire]): closed perimeter
+            keep (Keep, optional): which object(s) to return. Defaults to Keep.INSIDE.
+
+        Raises:
+            ValueError: perimeter must be closed
+            ValueError: keep must be one of Keep.INSIDE|OUTSIDE|BOTH
+
+        Returns:
+            Union[Optional[Shell], Optional[Face],
+            Tuple[Optional[Shell], Optional[Face]]]: The result of the split operation.
+
+            - **Keep.INSIDE**: Returns the inside part as a `Shell` or `Face`, or `None`
+              if no inside part is found.
+            - **Keep.OUTSIDE**: Returns the outside part as a `Shell` or `Face`, or `None`
+              if no outside part is found.
+            - **Keep.BOTH**: Returns a tuple `(inside, outside)` where each element is
+              either a `Shell`, `Face`, or `None` if no corresponding part is found.
+
+        """
+
+        def get(los: TopTools_ListOfShape, shape_cls) -> list:
+            shapes = []
+            for _ in range(los.Size()):
+                shapes.append(shape_cls(los.First()))
+                los.RemoveFirst()
+            return shapes
+
+        if keep not in {Keep.INSIDE, Keep.OUTSIDE, Keep.BOTH}:
+            raise ValueError(
+                "keep must be one of Keep.INSIDE, Keep.OUTSIDE, or Keep.BOTH"
+            )
+
+        # Process the perimeter
+        if not perimeter.is_closed:
+            raise ValueError("perimeter must be a closed Wire or Edge")
+        perimeter_edges = TopTools_SequenceOfShape()
+        for perimeter_edge in perimeter.edges():
+            perimeter_edges.Append(perimeter_edge.wrapped)
+
+        # Split the faces by the perimeter edges
+        lefts: list[Face] = []
+        rights: list[Face] = []
+        for target_face in self.faces():
+            constructor = BRepFeat_SplitShape(target_face.wrapped)
+            constructor.Add(perimeter_edges)
+            constructor.Build()
+            lefts.extend(get(constructor.Left(), Face))
+            rights.extend(get(constructor.Right(), Face))
+
+        left = None if not lefts else lefts[0] if len(lefts) == 1 else Shell(lefts)
+        right = None if not rights else rights[0] if len(rights) == 1 else Shell(rights)
+
+        # Is left or right the inside?
+        perimeter_length = perimeter.length
+        left_perimeter_length = (
+            sum(e.length for e in left.edges()) if not left is None else 0
+        )
+        right_perimeter_length = (
+            sum(e.length for e in right.edges()) if not right is None else 0
+        )
+        left_inside = abs(perimeter_length - left_perimeter_length) < abs(
+            perimeter_length - right_perimeter_length
+        )
         if keep == Keep.BOTH:
-            result = Compound(downcast(splitter.Shape()))
-        else:
-            parts = list(Compound(downcast(splitter.Shape())))
-            tops = []
-            bottoms = []
-            for part in parts:
-                if plane.to_local_coords(part).center().Z >= 0:
-                    tops.append(part)
-                else:
-                    bottoms.append(part)
-            if keep == Keep.TOP:
-                if len(tops) == 1:
-                    result = tops[0]
-                else:
-                    result = Compound(tops)
-            elif keep == Keep.BOTTOM:
-                if len(bottoms) == 1:
-                    result = bottoms[0]
-                else:
-                    result = Compound(bottoms)
-        return result
+            return (left, right) if left_inside else (right, left)
+        elif keep == Keep.INSIDE:
+            return left if left_inside else right
+        else:  # keep == Keep.OUTSIDE:
+            return right if left_inside else left
 
     def distance(self, other: Shape) -> float:
         """Minimal distance between two shapes
@@ -2987,7 +3103,7 @@ class Shape(NodeMixin):
         t_o.SetTranslation(Vector(offset).wrapped)
         return self._apply_transform(t_o * t_rx * t_ry * t_rz)
 
-    def find_intersection(self, axis: Axis) -> list[tuple[Vector, Vector]]:
+    def find_intersection_points(self, axis: Axis) -> list[tuple[Vector, Vector]]:
         """Find point and normal at intersection
 
         Return both the point(s) and normal(s) of the intersection of the axis and the shape
@@ -3030,6 +3146,10 @@ class Shape(NodeMixin):
             result.append((pnt, normal))
 
         return result
+
+    @deprecated("Use find_intersection_points instead")
+    def find_intersection(self, axis: Axis) -> list[tuple[Vector, Vector]]:
+        return self.find_intersection_points(axis)
 
     def project_faces(
         self,
@@ -3079,7 +3199,9 @@ class Shape(NodeMixin):
             path_position = path.position_at(relative_position_on_wire)
             path_tangent = path.tangent_at(relative_position_on_wire)
             projection_axis = Axis(path_position, shape_center - path_position)
-            (surface_point, surface_normal) = self.find_intersection(projection_axis)[0]
+            (surface_point, surface_normal) = self.find_intersection_points(
+                projection_axis
+            )[0]
             surface_normal_plane = Plane(
                 origin=surface_point, x_dir=path_tangent, z_dir=surface_normal
             )
@@ -3702,9 +3824,19 @@ class ShapeList(list[T]):
         """Filter by axis or geomtype operator |"""
         return self.filter_by(filter_by)
 
-    def __eq__(self, other: ShapeList):
+    def __eq__(self, other: object):
         """ShapeLists equality operator =="""
-        return set(self) == set(other)
+        return (
+            set(self) == set(other) if isinstance(other, ShapeList) else NotImplemented
+        )
+
+    # Normally implementing __eq__ is enough, but ShapeList subclasses list,
+    # which already implements __ne__, so we need to override it, too
+    def __ne__(self, other: ShapeList):
+        """ShapeLists inequality operator !="""
+        return (
+            set(self) != set(other) if isinstance(other, ShapeList) else NotImplemented
+        )
 
     def __add__(self, other: ShapeList):
         """Combine two ShapeLists together operator +"""
@@ -4264,6 +4396,14 @@ class Compound(Mixin3D, Shape):
             yield Shape.cast(iterator.Value())
             iterator.Next()
 
+    def __len__(self) -> int:
+        """Return the number of subshapes"""
+        count = 0
+        if self.wrapped is not None:
+            for _ in self:
+                count += 1
+        return count
+
     def __bool__(self) -> bool:
         """
         Check if empty.
@@ -4331,26 +4471,30 @@ class Compound(Mixin3D, Shape):
 
     def get_type(
         self,
-        obj_type: Union[Type[Edge], Type[Face], Type[Shell], Type[Solid], Type[Wire]],
-    ) -> list[Union[Edge, Face, Shell, Solid, Wire]]:
+        obj_type: Union[
+            Type[Vertex], Type[Edge], Type[Face], Type[Shell], Type[Solid], Type[Wire]
+        ],
+    ) -> list[Union[Vertex, Edge, Face, Shell, Solid, Wire]]:
         """get_type
 
         Extract the objects of the given type from a Compound. Note that this
         isn't the same as Faces() etc. which will extract Faces from Solids.
 
         Args:
-            obj_type (Union[Edge, Face, Solid]): Object types to extract
+            obj_type (Union[Vertex, Edge, Face, Shell, Solid, Wire]): Object types to extract
 
         Returns:
-            list[Union[Edge, Face, Solid]]: Extracted objects
+            list[Union[Vertex, Edge, Face, Shell, Solid, Wire]]: Extracted objects
         """
 
         type_map = {
+            Vertex: TopAbs_ShapeEnum.TopAbs_VERTEX,
             Edge: TopAbs_ShapeEnum.TopAbs_EDGE,
             Face: TopAbs_ShapeEnum.TopAbs_FACE,
             Shell: TopAbs_ShapeEnum.TopAbs_SHELL,
             Solid: TopAbs_ShapeEnum.TopAbs_SOLID,
             Wire: TopAbs_ShapeEnum.TopAbs_WIRE,
+            Compound: TopAbs_ShapeEnum.TopAbs_COMPOUND,
         }
         results = []
         for comp in self.compounds():
@@ -4359,10 +4503,42 @@ class Compound(Mixin3D, Shape):
             while iterator.More():
                 child = iterator.Value()
                 if child.ShapeType() == type_map[obj_type]:
-                    results.append(obj_type(child))
+                    results.append(obj_type(downcast(child)))
                 iterator.Next()
 
         return results
+
+    def unwrap(self, fully: bool = True) -> Union[Self, Shape]:
+        """Strip unnecessary Compound wrappers
+
+        Args:
+            fully (bool, optional): return base shape without any Compound
+                wrappers (otherwise one Compound is left). Defaults to True.
+
+        Returns:
+            Union[Self, Shape]: base shape
+        """
+        if len(self) == 1:
+            single_element = next(iter(self))
+
+            # If the single element is another Compound, unwrap it recursively
+            if isinstance(single_element, Compound):
+                # Unwrap recursively and copy attributes down
+                unwrapped = single_element.unwrap(fully)
+                if not fully:
+                    unwrapped = type(self)(unwrapped.wrapped)
+                attr_to_copy = [
+                    attr
+                    for attr in self.__dict__.keys()
+                    if attr not in ["wrapped", "_NodeMixin__children"]
+                ]
+                self.copy_attributes_to(unwrapped, attr_to_copy)
+                return unwrapped
+
+            return single_element if fully else self
+
+        # If there are no elements or more than one element, return self
+        return self
 
 
 class Part(Compound):
@@ -4411,6 +4587,77 @@ class Edge(Mixin1D, Shape):
     # pylint: disable=too-many-public-methods
 
     _dim = 1
+
+    @overload
+    def __init__(
+        self,
+        obj: TopoDS_Shape,
+        label: str = "",
+        color: Color = None,
+        parent: Compound = None,
+    ):
+        """Build an Edge from an OCCT TopoDS_Shape/TopoDS_Edge
+
+        Args:
+            obj (TopoDS_Shape, optional): OCCT Face.
+            label (str, optional): Defaults to ''.
+            color (Color, optional): Defaults to None.
+            parent (Compound, optional): assembly parent. Defaults to None.
+        """
+
+    @overload
+    def __init__(
+        self,
+        axis: Axis,
+        label: str = "",
+        color: Color = None,
+        parent: Compound = None,
+    ):
+        """Build an infinite Edge from an Axis
+
+        Args:
+            axis (Axis): Axis to be converted to an infinite Edge
+            label (str, optional): Defaults to ''.
+            color (Color, optional): Defaults to None.
+            parent (Compound, optional): assembly parent. Defaults to None.
+        """
+
+    def __init__(self, *args, **kwargs):
+        axis, obj, label, color, parent = (None,) * 5
+
+        if args:
+            l_a = len(args)
+            if isinstance(args[0], TopoDS_Shape):
+                obj, label, color, parent = args[:4] + (None,) * (4 - l_a)
+            elif isinstance(args[0], Axis):
+                axis, label, color, parent = args[:4] + (None,) * (4 - l_a)
+
+        unknown_args = ", ".join(
+            set(kwargs.keys()).difference(["axis", "obj", "label", "color", "parent"])
+        )
+        if unknown_args:
+            raise ValueError(f"Unexpected argument(s) {unknown_args}")
+
+        obj = kwargs.get("obj", obj)
+        axis = kwargs.get("axis", axis)
+        label = kwargs.get("label", label)
+        color = kwargs.get("color", color)
+        parent = kwargs.get("parent", parent)
+
+        if axis is not None:
+            obj = BRepBuilderAPI_MakeEdge(
+                Geom_Line(
+                    axis.position.to_pnt(),
+                    axis.direction.to_dir(),
+                )
+            ).Edge()
+
+        super().__init__(
+            obj=obj,
+            label="" if label is None else label,
+            color=color,
+            parent=parent,
+        )
 
     def _geom_adaptor(self) -> BRepAdaptor_Curve:
         """ """
@@ -4498,16 +4745,40 @@ class Edge(Mixin1D, Shape):
             intercept_pnts = []
             for i in range(min_range, max_range + 1, 360):
                 line = Edge.make_line((0, angle + i, 0), (100, angle + i, 0))
-                intercept_pnts.extend(tan_curve.intersections(line))
+                intercept_pnts.extend(tan_curve.find_intersection_points(line))
 
             u_values = [p.X for p in intercept_pnts]
 
         return u_values
 
-    def intersections(
+    def _intersect_with_edge(self, edge: Edge) -> Shape:
+        # Find any intersection points
+        vertex_intersections = [
+            Vertex(pnt) for pnt in self.find_intersection_points(edge)
+        ]
+
+        # Find Edge/Edge overlaps
+        intersect_op = BRepAlgoAPI_Common()
+        edge_intersections = self._bool_op((self,), (edge,), intersect_op).edges()
+
+        return Compound(vertex_intersections + edge_intersections)
+
+    def _intersect_with_axis(self, axis: Axis) -> Shape:
+        # Find any intersection points
+        vertex_intersections = [
+            Vertex(pnt) for pnt in self.find_intersection_points(axis)
+        ]
+
+        # Find Edge/Edge overlaps
+        intersect_op = BRepAlgoAPI_Common()
+        edge_intersections = self._bool_op((self,), (Edge(axis),), intersect_op).edges()
+
+        return Compound(vertex_intersections + edge_intersections)
+
+    def find_intersection_points(
         self, edge: Union[Axis, Edge] = None, tolerance: float = TOLERANCE
     ) -> ShapeList[Vector]:
-        """intersections
+        """find_intersection_points
 
         Determine the points where a 2D edge crosses itself or another 2D edge
 
@@ -4563,22 +4834,43 @@ class Edge(Mixin1D, Shape):
         crosses = [plane.from_local_coords(p) for p in crosses]
 
         # crosses may contain points beyond the ends of the edge so
-        # filter those out (a param_at problem?)
+        # .. filter those out
         valid_crosses = []
         for pnt in crosses:
             try:
                 if edge is not None:
-                    if (-tolerance <= self.param_at_point(pnt) <= 1.0 + tolerance) and (
-                        -tolerance <= edge.param_at_point(pnt) <= 1.0 + tolerance
+                    if (
+                        self.distance_to(pnt) <= TOLERANCE
+                        and edge.distance_to(pnt) <= TOLERANCE
                     ):
                         valid_crosses.append(pnt)
                 else:
-                    if -tolerance <= self.param_at_point(pnt) <= 1.0 + tolerance:
+                    if self.distance_to(pnt) <= TOLERANCE:
                         valid_crosses.append(pnt)
             except ValueError:
                 pass  # skip invalid points
 
         return ShapeList(valid_crosses)
+
+    def intersect(self, other: Union[Edge, Axis]) -> Union[Shape, None]:
+        intersection: Compound
+        if isinstance(other, Edge):
+            intersection = self._intersect_with_edge(other)
+        elif isinstance(other, Axis):
+            intersection = self._intersect_with_axis(other)
+        else:
+            return NotImplemented
+
+        if intersection is not None:
+            # If there is just one vertex or edge return it
+            vertices = intersection.get_type(Vertex)
+            edges = intersection.get_type(Edge)
+            if len(vertices) == 1 and len(edges) == 0:
+                return vertices[0]
+            elif len(vertices) == 0 and len(edges) == 1:
+                return edges[0]
+            else:
+                return intersection
 
     def reversed(self) -> Edge:
         """Return a copy of self with the opposite orientation"""
@@ -4657,28 +4949,42 @@ class Edge(Mixin1D, Shape):
         return Edge(new_edge)
 
     def param_at_point(self, point: VectorLike) -> float:
-        """Parameter at point of Edge"""
+        """Normalized parameter at point along Edge"""
 
-        def _project_point_on_curve(curve, gp_pnt) -> float:
-            projector = GeomAPI_ProjectPointOnCurve(gp_pnt, curve)
-            parameter = projector.LowerDistanceParameter()
-            return parameter
+        # Note that this search algorithm would ideally be replaced with
+        # an OCP based solution, something like that which is shown below.
+        # However, there are known issues with the OCP methods for some
+        # curves which may return negative values or incorrect values at
+        # end points. Also note that this search takes about 1.5ms while
+        # the OCP methods take about 0.4ms.
+        #
+        # curve = BRep_Tool.Curve_s(self.wrapped, float(), float())
+        # param_min, param_max = BRep_Tool.Range_s(self.wrapped)
+        # projector = GeomAPI_ProjectPointOnCurve(point.to_pnt(), curve)
+        # param_value = projector.LowerDistanceParameter()
+        # u_value = (param_value - param_min) / (param_max - param_min)
 
         point = Vector(point)
 
-        if self.distance_to(point) > TOLERANCE:
+        if not isclose_b(self.distance_to(point), 0, abs_tol=TOLERANCE):
             raise ValueError(f"point ({point}) is not on edge")
 
-        # Get the extreme of the parameter values for this Edge/Wire
-        curve = BRep_Tool.Curve_s(self.wrapped, 0, 1)
-        param_min = _project_point_on_curve(curve, self.position_at(0).to_pnt())
-        param_value = _project_point_on_curve(curve, point.to_pnt())
-        if self.is_closed:
-            u_value = (param_value - param_min) / (self.param_at(1) - self.param_at(0))
-        else:
-            param_max = _project_point_on_curve(curve, self.position_at(1).to_pnt())
-            u_value = (param_value - param_min) / (param_max - param_min)
+        # Function to be minimized
+        def func(param: ndarray) -> float:
+            return (self.position_at(param[0]) - point).length
 
+        # Find the u value that results in a point within tolerance of the target
+        initial_guess = max(
+            0.0, min(1.0, (point - self.position_at(0)).length / self.length)
+        )
+        result = minimize(
+            func,
+            x0=initial_guess,
+            method="Nelder-Mead",
+            bounds=[(0.0, 1.0)],
+            tol=TOLERANCE,
+        )
+        u_value = float(result.x[0])
         return u_value
 
     @classmethod
@@ -5483,6 +5789,15 @@ class Face(Shape):
 
         return Vector(gp_pnt)
 
+    def location_at(self, u: float, v: float, x_dir: VectorLike = None) -> Location:
+        """Location at the u/v position of face"""
+        origin = self.position_at(u, v)
+        if x_dir is None:
+            pln = Plane(origin, z_dir=self.normal_at(origin))
+        else:
+            pln = Plane(origin, x_dir=Vector(x_dir), z_dir=self.normal_at(origin))
+        return Location(pln)
+
     def center(self, center_of=CenterOf.GEOMETRY) -> Vector:
         """Center of Face
 
@@ -5727,39 +6042,39 @@ class Face(Shape):
 
         return sewn_faces
 
-    # @classmethod
-    # def sweep(cls, profile: Edge, path: Union[Edge, Wire]) -> Face:
-    #     """Sweep a 1D profile along a 1D path"""
-    #     if isinstance(path, Edge):
-    #         path = Wire([path])
-    #     # Ensure the edges in the path are ordered correctly
-    #     path = Wire(path.order_edges())
-    #     pipe_sweep = BRepOffsetAPI_MakePipe(path.wrapped, profile.wrapped)
-    #     pipe_sweep.Build()
-    #     return Face(pipe_sweep.Shape())
-
     @classmethod
     def sweep(
         cls,
-        profile: Union[Edge, Wire],
-        path: Union[Edge, Wire],
-        transition=Transition.RIGHT,
+        profile: Union[Curve, Edge, Wire],
+        path: Union[Curve, Edge, Wire],
+        transition=Transition.TRANSFORMED,
     ) -> Face:
         """sweep
 
-        Sweep a 1D profile along a 1D path
+        Sweep a 1D profile along a 1D path. Both the profile and path must be composed
+        of only 1 Edge.
 
         Args:
-            profile (Union[Edge, Wire]): the object to sweep
-            path (Union[Wire, Edge]): the path to follow when sweeping
+            profile (Union[Curve,Edge,Wire]): the object to sweep
+            path (Union[Curve,Edge,Wire]): the path to follow when sweeping
             transition (Transition, optional): handling of profile orientation at C1 path
-                discontinuities. Defaults to Transition.RIGHT.
+                discontinuities. Defaults to Transition.TRANSFORMED.
+
+        Raises:
+            ValueError: Only 1 Edge allowed in profile & path
 
         Returns:
             Face: resulting face, may be non-planar
         """
-        profile = profile.to_wire()
-        path = Wire(Wire(path).order_edges())
+        # Note: BRepOffsetAPI_MakePipe is an option here
+        # pipe_sweep = BRepOffsetAPI_MakePipe(path.wrapped, profile.wrapped)
+        # pipe_sweep.Build()
+        # return Face(pipe_sweep.Shape())
+
+        if len(profile.edges()) != 1 or len(path.edges()) != 1:
+            raise ValueError("Use Shell.sweep for multi Edge objects")
+        profile = Wire([profile.edge()])
+        path = Wire([path.edge()])
         builder = BRepOffsetAPI_MakePipeShell(path.wrapped)
         builder.Add(profile.wrapped, False, False)
         builder.SetTransitionMode(Solid._transModeDict[transition])
@@ -6065,7 +6380,7 @@ class Face(Shape):
 
         return (
             plane.contains(Vector(gp_pnt))
-            and (plane.z_dir - Vector(normal)).length < TOLERANCE
+            and 1 - abs(plane.z_dir.dot(Vector(normal))) < TOLERANCE
         )
 
     def thicken(self, depth: float, normal_override: VectorLike = None) -> Solid:
@@ -6528,6 +6843,34 @@ class Shell(Shape):
         properties = GProp_GProps()
         BRepGProp.LinearProperties_s(self.wrapped, properties)
         return Vector(properties.CentreOfMass())
+
+    @classmethod
+    def sweep(
+        cls,
+        profile: Union[Curve, Edge, Wire],
+        path: Union[Curve, Edge, Wire],
+        transition=Transition.TRANSFORMED,
+    ) -> Shell:
+        """sweep
+
+        Sweep a 1D profile along a 1D path
+
+        Args:
+            profile (Union[Curve, Edge, Wire]): the object to sweep
+            path (Union[Curve, Edge, Wire]): the path to follow when sweeping
+            transition (Transition, optional): handling of profile orientation at C1 path
+                discontinuities. Defaults to Transition.TRANSFORMED.
+
+        Returns:
+            Shell: resulting Shell, may be non-planar
+        """
+        profile = Wire(profile.edges())
+        path = Wire(Wire(path.edges()).order_edges())
+        builder = BRepOffsetAPI_MakePipeShell(path.wrapped)
+        builder.Add(profile.wrapped, False, False)
+        builder.SetTransitionMode(Solid._transModeDict[transition])
+        builder.Build()
+        return Shape.cast(builder.Shape())
 
 
 class Solid(Mixin3D, Shape):
@@ -7774,7 +8117,7 @@ class Wire(Mixin1D, Shape):
 
         return distance / wire_length
 
-    def trim(self, start: float, end: float) -> Wire:
+    def trim(self: Wire, start: float, end: float) -> Wire:
         """trim
 
         Create a new wire by keeping only the section between start and end.
@@ -7789,76 +8132,76 @@ class Wire(Mixin1D, Shape):
         Returns:
             Wire: trimmed wire
         """
+
         # pylint: disable=too-many-branches
         if start >= end:
             raise ValueError("start must be less than end")
 
-        trim_start_point = self.position_at(start)
-        trim_end_point = self.position_at(end)
+        edges = self.edges()
 
         # If this is really just an edge, skip the complexity of a Wire
-        if len(self.edges()) == 1:
-            return Wire([self.edge().trim(start, end)])
+        if len(edges) == 1:
+            return Wire([edges[0].trim(start, end)])
 
-        # Get all the edges
-        modified_edges: list[Edge] = []
-        unmodified_edges: list[Edge] = []
-        for edge in self.edges():
-            # Is edge flipped
-            flipped = self.param_at_point(edge.position_at(0)) > self.param_at_point(
-                edge.position_at(1)
-            )
-            # Does this edge contain the start/end points
-            contains_start = edge.distance_to(trim_start_point) <= TOLERANCE
-            contains_end = edge.distance_to(trim_end_point) <= TOLERANCE
+        # For each Edge determine the beginning and end wire parameters
+        # Note that u, v values are parameters along the Wire
+        edges_uv_values: list[tuple[float, float, Edge]] = []
+        found_end_of_wire = False  # for finding ends of closed wires
 
-            # Trim edges containing start or end points
-            degenerate = False
-            if contains_start and contains_end:
-                u_start = edge.param_at_point(trim_start_point)
-                u_end = edge.param_at_point(trim_end_point)
-                edge = edge.trim(u_start, u_end)
-            elif contains_start:
-                u_value = edge.param_at_point(trim_start_point)
-                if not flipped:
-                    degenerate = u_value == 1.0
-                    if not degenerate:
-                        edge = edge.trim(u_value, 1.0)
-                elif flipped:
-                    degenerate = u_value == 0.0
-                    if not degenerate:
-                        edge = edge.trim(0.0, u_value)
-            elif contains_end:
-                u_value = edge.param_at_point(trim_end_point)
-                if not flipped:
-                    degenerate = u_value == 0.0
-                    if not degenerate:
-                        edge = edge.trim(0.0, u_value)
-                elif flipped:
-                    degenerate = u_value == 1.0
-                    if not degenerate:
-                        edge = edge.trim(u_value, 1.0)
-            if not degenerate:
-                if contains_start or contains_end:
-                    modified_edges.append(edge)
-                else:
-                    unmodified_edges.append(edge)
+        for e in edges:
+            u = self.param_at_point(e.position_at(0))
+            v = self.param_at_point(e.position_at(1))
+            if self.is_closed:  # Avoid two beginnings or ends
+                u = (
+                    1 - u
+                    if found_end_of_wire and (isclose_b(u, 0) or isclose_b(u, 1))
+                    else u
+                )
+                v = (
+                    1 - v
+                    if found_end_of_wire and (isclose_b(v, 0) or isclose_b(v, 1))
+                    else v
+                )
+                found_end_of_wire = (
+                    isclose_b(u, 0)
+                    or isclose_b(u, 1)
+                    or isclose_b(v, 0)
+                    or isclose_b(v, 1)
+                    or found_end_of_wire
+                )
 
-        # Select the wire containing the start and end points
-        wire_segments = edges_to_wires(modified_edges + unmodified_edges)
-        trimmed_wire = filter(
-            lambda w: all(
-                [
-                    w.distance_to(p) <= TOLERANCE
-                    for p in [trim_start_point, trim_end_point]
-                ]
-            ),
-            wire_segments,
-        )
-        try:
-            return next(trimmed_wire)
-        except StopIteration as exc:
-            raise RuntimeError("Invalid trim result") from exc
+            # Edge might be reversed and require flipping parms
+            u, v = (v, u) if u > v else (u, v)
+
+            edges_uv_values.append((u, v, e))
+
+        new_edges = []
+        for u, v, e in edges_uv_values:
+            if v < start or u > end:  # Edge not needed
+                continue
+
+            elif start <= u and v <= end:  # keep whole Edge
+                new_edges.append(e)
+
+            elif start >= u and end <= v:  # Wire trimmed to single Edge
+                u_edge = e.param_at_point(self.position_at(start))
+                v_edge = e.param_at_point(self.position_at(end))
+                u_edge, v_edge = (
+                    (v_edge, u_edge) if u_edge > v_edge else (u_edge, v_edge)
+                )
+                new_edges.append(e.trim(u_edge, v_edge))
+
+            elif start <= u:  # keep start of Edge
+                u_edge = e.param_at_point(self.position_at(end))
+                if u_edge != 0:
+                    new_edges.append(e.trim(0, u_edge))
+
+            else:  #  v <= end  keep end of Edge
+                v_edge = e.param_at_point(self.position_at(start))
+                if v_edge != 1:
+                    new_edges.append(e.trim(v_edge, 1))
+
+        return Wire(new_edges)
 
     def order_edges(self) -> ShapeList[Edge]:
         """Return the edges in self ordered by wire direction and orientation"""
@@ -8451,6 +8794,23 @@ def fix(obj: TopoDS_Shape) -> TopoDS_Shape:
     return downcast(shape_fix.Shape())
 
 
+def isclose_b(a: float, b: float, rel_tol=1e-9, abs_tol=1e-14) -> bool:
+    """Determine whether two floating point numbers are close in value.
+    Overridden abs_tol default for the math.isclose function.
+
+    Args:
+        a (float): First value to compare
+        b (float): Second value to compare
+        rel_tol (float, optional): Maximum difference for being considered "close", relative to the
+    magnitude of the input values. Defaults to 1e-9.
+        abs_tol (float, optional): Maximum difference for being considered "close", regardless of the
+    magnitude of the input values. Defaults to 1e-14 (unlike math.isclose which defaults to zero).
+
+    Returns: True if a is close in value to b, and False otherwise.
+    """
+    return isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
+
+
 def shapetype(obj: TopoDS_Shape) -> TopAbs_ShapeEnum:
     """Return TopoDS_Shape's TopAbs_ShapeEnum"""
     if obj.IsNull():
@@ -8627,98 +8987,3 @@ class SkipClean:
 
     def __exit__(self, exception_type, exception_value, traceback):
         SkipClean.clean = True
-
-
-# Monkey-patched Axis and Plane methods that take Shapes as arguments
-def _axis_as_infinite_edge(self: Axis) -> Edge:
-    """return an edge with infinite length along self"""
-    return Edge(
-        BRepBuilderAPI_MakeEdge(
-            Geom_Line(
-                self.position.to_pnt(),
-                self.direction.to_dir(),
-            )
-        ).Edge()
-    )
-
-
-Axis.as_infinite_edge = _axis_as_infinite_edge
-
-
-def _axis_intersect(self: Axis, *to_intersect: Union[Shape, Axis, Plane]) -> Shape:
-    """axis intersect
-
-    Args:
-        to_intersect (sequence of Union[Shape, Axis, Plane]): objects to intersect
-            with Axis.
-
-    Returns:
-        Shape: result of intersection
-    """
-    self_i_edge: Edge = self.as_infinite_edge()
-    self_as_curve = Geom_Line(self.position.to_pnt(), self.direction.to_dir())
-
-    intersections = []
-    for intersector in to_intersect:
-        if isinstance(intersector, Axis):
-            intersector_as_edge: Edge = intersector.as_infinite_edge()
-            distance, point1, _point2 = self_i_edge.distance_to_with_closest_points(
-                intersector_as_edge
-            )
-            if distance <= TOLERANCE:
-                intersections.append(Vertex(*point1.to_tuple()))
-        elif isinstance(intersector, Plane):
-            geom_plane: Geom_Surface = Face.make_plane(intersector)._geom_adaptor()
-
-            # Create a GeomAPI_IntCS object and compute the intersection
-            int_cs = GeomAPI_IntCS(self_as_curve, geom_plane)
-            # Check if there is an intersection point
-            if int_cs.NbPoints() > 0:
-                intersections.append(Vertex(*Vector(int_cs.Point(1)).to_tuple()))
-        if isinstance(intersector, Shape):
-            intersections.extend(self_i_edge.intersect(intersector))
-
-    return (
-        intersections[0]
-        if len(intersections) == 1
-        else Compound(children=intersections)
-    )
-
-
-Axis.intersect = _axis_intersect
-
-
-def _axis_and(self: Axis, other: Union[Shape, Axis, Plane]) -> Shape:
-    """intersect shape with self operator &"""
-    return self.intersect(other)
-
-
-Axis.__and__ = _axis_and
-
-
-def _plane_intersect(self: Plane, *to_intersect: Union[Shape, Axis, Plane]) -> Shape:
-    """plane intersect
-
-    Args:
-        to_intersect (sequence of Union[Shape, Axis, Plane]): objects to intersect
-            with Plane.
-
-    Returns:
-        Shape: result of intersection
-    """
-    self_as_face: Face = Face.make_plane(self)
-    intersections = [
-        self_as_face.intersect(intersector) for intersector in to_intersect
-    ]
-    return Compound(children=intersections)
-
-
-Plane.intersect = _plane_intersect
-
-
-def _plane_and(self: Plane, other: Union[Shape, Axis, Plane]) -> Shape:
-    """intersect shape with self operator &"""
-    return self.intersect(other)
-
-
-Plane.__and__ = _plane_and

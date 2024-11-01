@@ -186,7 +186,7 @@ class DoubleTangentArc(BaseLineObject):
         validate_inputs(context, self)
 
         arc_pt = WorkplaneList.localize(pnt)
-        arc_tangent = WorkplaneList.localize(tangent)
+        arc_tangent = WorkplaneList.localize(tangent).normalized()
         if WorkplaneList._get_context() is not None:
             workplane = WorkplaneList._get_context().workplanes[0]
         else:
@@ -198,7 +198,7 @@ class DoubleTangentArc(BaseLineObject):
             workplane = -workplane  # Flip to help with TOP/BOTTOM
         rotation_axis = Axis((0, 0, 0), workplane.z_dir)
         # Protect against massive circles that are effectively straight lines
-        max_size = 2 * other.bounding_box().add(arc_pt).diagonal
+        max_size = 10 * other.bounding_box().add(arc_pt).diagonal
 
         # Function to be minimized - note radius is a numpy array
         def func(radius, perpendicular_bisector):
@@ -230,7 +230,7 @@ class DoubleTangentArc(BaseLineObject):
                 continue
             other_axis = Axis(p1, other.tangent_at(p1))
             circle_axis = Axis(p2, circle.tangent_at(p2))
-            if other_axis.is_parallel(circle_axis):
+            if other_axis.is_parallel(circle_axis, 0.05):
                 arc_centers.append(arc_center)
 
         if len(arc_centers) == 0:
@@ -247,7 +247,7 @@ class DoubleTangentArc(BaseLineObject):
                 _, p1, _ = other.distance_to_with_closest_points(center)
                 TangentArc(arc_pt, p1, tangent=arc_tangent)
 
-        super().__init__(double.line, mode=mode)
+        super().__init__(double.wire(), mode=mode)
 
 
 class EllipticalStartArc(BaseLineObject):
@@ -579,12 +579,14 @@ class JernArc(BaseLineObject):
 
         start = WorkplaneList.localize(start)
         self.start = start
-        start_tangent = WorkplaneList.localize(tangent).normalized()
         if context is None:
             jern_workplane = Plane.XY
         else:
             jern_workplane = copy.copy(WorkplaneList._get_context().workplanes[0])
         jern_workplane.origin = start
+        start_tangent = Vector(tangent).transform(
+            jern_workplane.reverse_transform, is_direction=True
+        )
 
         arc_direction = copysign(1.0, arc_size)
         self.center_point = start + start_tangent.rotate(
@@ -596,6 +598,7 @@ class JernArc(BaseLineObject):
         if abs(arc_size) >= 360:
             circle_plane = copy.copy(jern_workplane)
             circle_plane.origin = self.center_point
+            circle_plane.x_dir = self.start - circle_plane.origin
             arc = Edge.make_circle(radius, circle_plane)
         else:
             arc = Edge.make_tangent_arc(start, start_tangent, self.end_of_arc)
@@ -666,7 +669,7 @@ class IntersectingLine(BaseLineObject):
         axis = Axis(start, direction)
 
         intersection_pnts = [
-            i for edge in other.edges() for i in edge.intersections(axis)
+            i for edge in other.edges() for i in edge.find_intersection_points(axis)
         ]
         if not intersection_pnts:
             raise ValueError("No intersections found")

@@ -49,7 +49,7 @@ import warnings
 import functools
 from abc import ABC, abstractmethod
 from itertools import product
-from math import sqrt
+from math import sqrt, cos, pi
 from typing import Any, Callable, Iterable, Optional, Union, TypeVar
 from typing_extensions import Self, ParamSpec, Concatenate
 
@@ -92,7 +92,7 @@ logger = logging.getLogger("build123d")
 #
 
 # LENGTH CONSTANTS
-MC = 0.0001
+MC = 0.001
 MM = 1
 CM = 10 * MM
 M = 1000 * MM
@@ -280,9 +280,7 @@ class Builder(ABC):
                 "Transferring object(s) to %s", type(self.builder_parent).__name__
             )
             if self._obj is None and not sys.exc_info()[1]:
-                raise RuntimeError(
-                    f"{self._obj_name} is None - {self._tag} didn't create anything"
-                )
+                warnings.warn(f"{self._obj_name} is None - {self._tag} didn't create anything", stacklevel=2)
             self.builder_parent._add_to_context(self._obj, mode=self.mode)
 
         self.exit_workplanes = WorkplaneList._get_context().workplanes
@@ -361,7 +359,8 @@ class Builder(ABC):
             # Generate an exception if not processing exceptions
             if len(objects) != num_stored and not sys.exc_info()[1]:
                 unsupported = set(objects) - set(v for l in typed.values() for v in l)
-                raise ValueError(f"{self._tag} doesn't accept {unsupported}")
+                if unsupported != {None}:
+                    raise ValueError(f"{self._tag} doesn't accept {unsupported}")
 
             # Extract base objects from Compounds
             compound: Compound
@@ -860,20 +859,30 @@ class HexLocations(LocationList):
     """Location Context: Hex Array
 
     Creates a context of hexagon array of locations for Part or Sketch. When creating
-    hex locations for an array of circles, set `apothem` to the radius of the circle
+    hex locations for an array of circles, set `radius` to the radius of the circle
     plus one half the spacing between the circles.
 
     Args:
-        apothem (float): radius of the inscribed circle
-        xCount (int): number of points ( > 0 )
-        yCount (int): number of points ( > 0 )
+        radius (float): distance from origin to vertices (major), or
+            optionally from the origin to side (minor or apothem)
+            with major_radius = False
+        x_count (int): number of points ( > 0 )
+        y_count (int): number of points ( > 0 )
+        major_radius (bool): If True the radius is the major radius, else the
+            radius is the minor radius (also known as inscribed radius).
+            Defaults to False.
         align (Union[Align, tuple[Align, Align]], optional): align min, center, or max of object.
             Defaults to (Align.CENTER, Align.CENTER).
 
     Attributes:
-        apothem (float): radius of the inscribed circle
-        xCount (int): number of points ( > 0 )
-        yCount (int): number of points ( > 0 )
+        radius (float): distance from origin to vertices (major), or
+            optionally from the origin to side (minor or apothem)
+            with major_radius = False
+        apothem (float): radius of the inscribed circle, also known as minor radius
+        x_count (int): number of points ( > 0 )
+        y_count (int): number of points ( > 0 )
+        major_radius (bool): If True the radius is the major radius, else the
+            radius is the minor radius (also known as inscribed radius).
         align (Union[Align, tuple[Align, Align]]): align min, center, or max of object.
         diagonal (float): major radius
         local_locations (list{Location}): locations relative to workplane
@@ -884,23 +893,32 @@ class HexLocations(LocationList):
 
     def __init__(
         self,
-        apothem: float,
+        radius: float,
         x_count: int,
         y_count: int,
+        major_radius: bool = False,
         align: Union[Align, tuple[Align, Align]] = (Align.CENTER, Align.CENTER),
     ):
         # pylint: disable=too-many-locals
 
-        diagonal = 4 * apothem / sqrt(3)
+        if major_radius:
+            diagonal = 2 * radius
+            apothem = radius * cos(pi / 6)
+        else:
+            diagonal = 4 * radius / sqrt(3)
+            apothem = radius
+
         x_spacing = 3 * diagonal / 4
         y_spacing = diagonal * sqrt(3) / 2
         if x_spacing <= 0 or y_spacing <= 0 or x_count < 1 or y_count < 1:
             raise ValueError("Spacing and count must be > 0 ")
 
+        self.radius = radius
         self.apothem = apothem
         self.diagonal = diagonal
         self.x_count = x_count
         self.y_count = y_count
+        self.major_radius = major_radius
         self.align = tuplify(align, 2)
 
         # Generate the raw coordinates relative to bottom left point
@@ -1264,11 +1282,12 @@ class WorkplaneList:
 
 
 P = ParamSpec("P")
+T2 = TypeVar("T2")
 
 
 def __gen_context_component_getter(
-    func: Callable[Concatenate[Builder, P], T]
-) -> Callable[P, T]:
+    func: Callable[Concatenate[Builder, P], T2]
+) -> Callable[P, T2]:
     @functools.wraps(func)
     def getter(select: Select = Select.ALL):
         context = Builder._get_context(func.__name__)

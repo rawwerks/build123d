@@ -266,7 +266,7 @@ def export_step(
         unit (Unit, optional): shape units. Defaults to Unit.MM.
         write_pcurves (bool, optional): write parametric curves to the STEP file.
             Defaults to True.
-        precision_mode (bool, optional): geometric data precision.
+        precision_mode (PrecisionMode, optional): geometric data precision.
             Defaults to PrecisionMode.AVERAGE.
 
     Raises:

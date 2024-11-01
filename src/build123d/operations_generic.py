@@ -29,7 +29,7 @@ license:
 
 import copy
 import logging
-from math import radians, tan, isclose
+from math import radians, tan
 from typing import Union, Iterable
 
 from build123d.build_common import (
@@ -65,10 +65,12 @@ from build123d.topology import (
     Part,
     Shape,
     ShapeList,
+    Shell,
     Sketch,
     Solid,
     Vertex,
     Wire,
+    isclose_b,
 )
 
 logging.getLogger("build123d").addHandler(logging.NullHandler())
@@ -361,15 +363,13 @@ def chamfer(
         if not target.is_closed:
             object_list = filter(
                 lambda v: not (
-                    isclose(
+                    isclose_b(
                         (Vector(*v.to_tuple()) - target.position_at(0)).length,
                         0.0,
-                        abs_tol=1e-14,
                     )
-                    or isclose(
+                    or isclose_b(
                         (Vector(*v.to_tuple()) - target.position_at(1)).length,
                         0.0,
-                        abs_tol=1e-14,
                     )
                 ),
                 object_list,
@@ -462,15 +462,13 @@ def fillet(
         if not target.is_closed:
             object_list = filter(
                 lambda v: not (
-                    isclose(
+                    isclose_b(
                         (Vector(*v.to_tuple()) - target.position_at(0)).length,
                         0.0,
-                        abs_tol=1e-14,
                     )
-                    or isclose(
+                    or isclose_b(
                         (Vector(*v.to_tuple()) - target.position_at(1)).length,
                         0.0,
-                        abs_tol=1e-14,
                     )
                 ),
                 object_list,
@@ -618,7 +616,14 @@ def offset(
                     inner_wires.append(offset_wire)
             except:
                 pass
-        new_face = Face(outer_wire, inner_wires)
+        # inner wires may go beyond the outer wire so subtract faces
+        new_face = Face(outer_wire)
+        if inner_wires:
+            inner_faces = [Face(w) for w in inner_wires]
+            new_face = new_face.cut(*inner_faces)
+            if isinstance(new_face, Compound):
+                new_face = new_face.unwrap(fully=True)
+
         if (new_face.normal_at() - face.normal_at()).length > 0.001:
             new_face = -new_face
         new_faces.append(new_face)
@@ -729,7 +734,7 @@ def project(
     shape_list = [
         Vertex(*o.to_tuple()) if isinstance(o, Vector) else o for o in object_list
     ]
-    object_size = Compound(children=shape_list).bounding_box().diagonal
+    object_size = Compound(children=shape_list).bounding_box(optimal=False).diagonal
 
     point_list = [o for o in object_list if isinstance(o, (Vector, Vertex))]
     point_list = [Vector(pnt) for pnt in point_list]
@@ -794,9 +799,7 @@ def project(
             projection_axis = -Axis(pnt, workplane.z_dir * projection_flip)
         else:
             projection_axis = Axis(pnt, workplane.z_dir * projection_flip)
-        projection = workplane.to_local_coords(
-            workplane.find_intersection(projection_axis)
-        )
+        projection = workplane.to_local_coords(workplane.intersect(projection_axis))
         if projection is not None:
             projected_points.append(projection)
 
@@ -883,12 +886,12 @@ def scale(
 
     scale_compound = Compound(new_objects)
     if all([obj._dim == 3 for obj in object_list]):
-        return Part(scale_compound.wrapped)
-    if all([obj._dim == 2 for obj in object_list]):
-        return Sketch(scale_compound.wrapped)
-    if all([obj._dim == 1 for obj in object_list]):
-        return Curve(scale_compound.wrapped)
-    return scale_compound
+        scale_compound = Part(scale_compound.wrapped)
+    elif all([obj._dim == 2 for obj in object_list]):
+        scale_compound = Sketch(scale_compound.wrapped)
+    elif all([obj._dim == 1 for obj in object_list]):
+        scale_compound = Curve(scale_compound.wrapped)
+    return scale_compound.unwrap(fully=False)
 
 
 #:TypeVar("SplitType"): Type of objects which can be offset
@@ -897,7 +900,7 @@ SplitType = Union[Edge, Wire, Face, Solid]
 
 def split(
     objects: Union[SplitType, Iterable[SplitType]] = None,
-    bisect_by: Plane = Plane.XZ,
+    bisect_by: Union[Plane, Face] = Plane.XZ,
     keep: Keep = Keep.TOP,
     mode: Mode = Mode.REPLACE,
 ):
@@ -909,7 +912,8 @@ def split(
 
     Args:
         objects (Union[Edge, Wire, Face, Solid] or Iterable of), objects to split
-        bisect_by (Plane, optional): plane to segment part. Defaults to Plane.XZ.
+        bisect_by (Union[Plane, Face], optional): plane to segment part.
+            Defaults to Plane.XZ.
         keep (Keep, optional): selector for which segment to keep. Defaults to Keep.TOP.
         mode (Mode, optional): combination mode. Defaults to Mode.REPLACE.
 
@@ -970,7 +974,7 @@ def sweep(
         multisection (bool, optional): sweep multiple on path. Defaults to False.
         is_frenet (bool, optional): use frenet algorithm. Defaults to False.
         transition (Transition, optional): discontinuity handling option.
-            Defaults to Transition.RIGHT.
+            Defaults to Transition.TRANSFORMED.
         normal (VectorLike, optional): fixed normal. Defaults to None.
         binormal (Union[Edge, Wire], optional): guide rotation along path. Defaults to None.
         clean (bool, optional): Remove extraneous internal structure. Defaults to True.
@@ -1050,9 +1054,7 @@ def sweep(
     new_faces = []
     if edge_list:
         for sec in section_list:
-            swept = Face.sweep(
-                sec, path_wire, transition
-            )  # Could generate a shell here
+            swept = Shell.sweep(sec, path_wire, transition)
             new_faces.extend(swept.faces())
 
     if context is not None:

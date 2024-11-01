@@ -37,6 +37,8 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import numpy as np
+
 from math import degrees, pi, radians
 from typing import (
     Any,
@@ -59,7 +61,7 @@ from OCP.BRepGProp import BRepGProp, BRepGProp_Face  # used for mass calculation
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRepTools import BRepTools
 from OCP.Geom import Geom_Line, Geom_Plane
-from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf, GeomAPI_IntCS
+from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf, GeomAPI_IntCS, GeomAPI_IntSS
 from OCP.gp import (
     gp_Ax1,
     gp_Ax2,
@@ -93,6 +95,38 @@ TOLERANCE = 1e-6
 TOL = 1e-2
 DEG2RAD = pi / 180.0
 RAD2DEG = 180 / pi
+
+
+def _parse_intersect_args(*args, **kwargs):
+    axis, plane, vector, location, shape = (None,) * 5
+
+    if args:
+        if isinstance(args[0], Axis):
+            axis = args[0]
+        elif isinstance(args[0], Plane):
+            plane = args[0]
+        elif isinstance(args[0], Location):
+            location = args[0]
+        elif isinstance(args[0], (Vector, tuple)):
+            vector = Vector(args[0])
+        elif hasattr(args[0], "wrapped"):
+            shape = args[0]
+        else:
+            raise ValueError(f"Unexpected argument type {type(args[0])}")
+
+    unknown_args = ", ".join(
+        set(kwargs.keys()).difference(["axis", "plane", "location", "vector", "shape"])
+    )
+    if unknown_args:
+        raise ValueError(f"Unexpected argument(s) {unknown_args}")
+
+    axis = kwargs.get("axis", axis)
+    plane = kwargs.get("plane", plane)
+    vector = kwargs.get("vector", vector)
+    location = kwargs.get("location", location)
+    shape = kwargs.get("shape", shape)
+
+    return axis, plane, vector, location, shape
 
 
 class Vector:
@@ -397,16 +431,23 @@ class Vector:
         """Vector length operator abs()"""
         return self.length
 
+    def __and__(self: Plane, other: Union[Axis, Location, Plane, VectorLike, "Shape"]):
+        """intersect vector with other &"""
+        return self.intersect(other)
+
     def __repr__(self) -> str:
         """Display vector"""
-        return "Vector: " + str((self.X, self.Y, self.Z))
+        x = round(self.X, 13) if abs(self.X) > TOLERANCE else 0.0
+        y = round(self.Y, 13) if abs(self.Y) > TOLERANCE else 0.0
+        z = round(self.Z, 13) if abs(self.Z) > TOLERANCE else 0.0
+        return f"Vector({x:.14g}, {y:.14g}, {z:.14g})"
 
-    def __str__(self) -> str:
-        """Display vector"""
-        return "Vector: " + str((self.X, self.Y, self.Z))
+    __str__ = __repr__
 
-    def __eq__(self, other: Vector) -> bool:  # type: ignore[override]
+    def __eq__(self, other: object) -> bool:
         """Vectors equal operator =="""
+        if not isinstance(other, Vector):
+            return NotImplemented
         return self.wrapped.IsEqual(other.wrapped, 0.00001, 0.00001)
 
     def __hash__(self) -> int:
@@ -429,13 +470,28 @@ class Vector:
         """Convert to OCCT gp_Dir object"""
         return gp_Dir(self.wrapped.XYZ())
 
-    def transform(self, affine_transform: Matrix) -> Vector:
-        """Apply affine transformation"""
-        # to gp_Pnt to obey build123d transformation convention (in OCP.vectors do not translate)
-        pnt = self.to_pnt()
-        pnt_t = pnt.Transformed(affine_transform.wrapped.Trsf())
+    def transform(self, affine_transform: Matrix, is_direction: bool = False) -> Vector:
+        """Apply affine transformation
 
-        return Vector(gp_Vec(pnt_t.XYZ()))
+        Args:
+            affine_transform (Matrix): affine transformation matrix
+            is_direction (bool, optional): Should self be transformed as a vector or direction?
+                Defaults to False (vector)
+
+        Returns:
+            Vector: transformed vector
+        """
+        if not is_direction:
+            # to gp_Pnt to obey build123d transformation convention (in OCP.vectors do not translate)
+            pnt = self.to_pnt()
+            pnt_t = pnt.Transformed(affine_transform.wrapped.Trsf())
+            return_value = Vector(gp_Vec(pnt_t.XYZ()))
+        else:
+            # to gp_Dir for transformation of "direction vectors" (no translation or scaling)
+            dir = self.to_dir()
+            dir_t = dir.Transformed(affine_transform.wrapped.Trsf())
+            return_value = Vector(gp_Vec(dir_t.XYZ()))
+        return return_value
 
     def rotate(self, axis: Axis, angle: float) -> Vector:
         """Rotate about axis
@@ -450,6 +506,40 @@ class Vector:
             Vector: rotated vector
         """
         return Vector(self.wrapped.Rotated(axis.wrapped, pi * angle / 180))
+
+    @overload
+    def intersect(self, vector: VectorLike) -> Union[Vector, None]:
+        """Find intersection of vector and vector"""
+
+    @overload
+    def intersect(self, location: Location) -> Union[Vector, None]:
+        """Find intersection of location and vector"""
+
+    @overload
+    def intersect(self, axis: Axis) -> Union[Vector, None]:
+        """Find intersection of axis and vector"""
+
+    @overload
+    def intersect(self, plane: Plane) -> Union[Vector, None]:
+        """Find intersection of plane and vector"""
+
+    def intersect(self, *args, **kwargs):
+        axis, plane, vector, location, shape = _parse_intersect_args(*args, **kwargs)
+
+        if axis is not None:
+            return axis.intersect(self)
+
+        elif plane is not None:
+            return plane.intersect(self)
+
+        elif vector is not None and self == vector:
+            return vector
+
+        elif location is not None:
+            return location.intersect(self)
+
+        elif shape is not None:
+            return shape.intersect(self)
 
 
 #:TypeVar("VectorLike"): Tuple of float or Vector defining a position in space
@@ -501,6 +591,10 @@ class Axis(metaclass=AxisMeta):
         return Location(Plane(origin=self.position, z_dir=self.direction))
 
     @overload
+    def __init__(self, gp_ax1: gp_Ax1):  # pragma: no cover
+        """Axis: point and direction"""
+
+    @overload
     def __init__(self, origin: VectorLike, direction: VectorLike):  # pragma: no cover
         """Axis: point and direction"""
 
@@ -509,12 +603,13 @@ class Axis(metaclass=AxisMeta):
         """Axis: start of Edge"""
 
     def __init__(self, *args, **kwargs):
-        origin = None
-        direction = None
+        gp_ax1, origin, direction = (None,) * 3
         if len(args) == 1:
             if type(args[0]).__name__ == "Edge":
                 origin = args[0].position_at(0)
                 direction = args[0].tangent_at(0)
+            elif isinstance(args[0], gp_Ax1):
+                gp_ax1 = args[0]
             else:
                 origin = args[0]
         if len(args) == 2:
@@ -523,44 +618,41 @@ class Axis(metaclass=AxisMeta):
 
         origin = kwargs.get("origin", origin)
         direction = kwargs.get("direction", direction)
+        gp_ax1 = kwargs.get("gp_ax1", gp_ax1)
         if "edge" in kwargs and type(kwargs["edge"]).__name__ == "Edge":
             origin = kwargs["edge"].position_at(0)
             direction = kwargs["edge"].tangent_at(0)
 
-        try:
-            origin = Vector(origin)
-            direction = Vector(direction)
-        except TypeError as exc:
-            raise ValueError("Invalid Axis parameters") from exc
-
-        self.wrapped = gp_Ax1(
-            Vector(origin).to_pnt(), gp_Dir(*Vector(direction).normalized().to_tuple())
+        unknown_args = ", ".join(
+            set(kwargs.keys()).difference(["gp_ax1", "origin", "direction", "edge"])
         )
+        if unknown_args:
+            raise ValueError(f"Unexpected argument(s) {unknown_args}")
+
+        if gp_ax1 is not None:
+            self.wrapped = gp_ax1
+        else:
+            try:
+                origin = Vector(origin)
+                direction = Vector(direction)
+            except TypeError as exc:
+                raise ValueError("Invalid Axis parameters") from exc
+
+            self.wrapped = gp_Ax1(
+                Vector(origin).to_pnt(),
+                gp_Dir(*Vector(direction).normalized().to_tuple()),
+            )
+
         self.position = Vector(
             self.wrapped.Location().X(),
             self.wrapped.Location().Y(),
             self.wrapped.Location().Z(),
-        )
+        )  #: Axis origin
         self.direction = Vector(
             self.wrapped.Direction().X(),
             self.wrapped.Direction().Y(),
             self.wrapped.Direction().Z(),
-        )
-
-    @classmethod
-    def from_occt(cls, axis: gp_Ax1) -> Axis:
-        """Create an Axis instance from the occt object"""
-        position = (
-            axis.Location().X(),
-            axis.Location().Y(),
-            axis.Location().Z(),
-        )
-        direction = (
-            axis.Direction().X(),
-            axis.Direction().Y(),
-            axis.Direction().Z(),
-        )
-        return Axis(position, direction)
+        )  #: Axis direction
 
     def __copy__(self) -> Axis:
         """Return copy of self"""
@@ -580,13 +672,13 @@ class Axis(metaclass=AxisMeta):
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Axis):
-            return False
+            return NotImplemented
         return self.position == other.position and self.direction == other.direction
 
     def located(self, new_location: Location):
         """relocates self to a new location possibly changing position and direction"""
         new_gp_ax1 = self.wrapped.Transformed(new_location.wrapped.Transformation())
-        return Axis.from_occt(new_gp_ax1)
+        return Axis(new_gp_ax1)
 
     def to_plane(self) -> Plane:
         """Return self as Plane"""
@@ -678,11 +770,93 @@ class Axis(metaclass=AxisMeta):
 
     def reverse(self) -> Axis:
         """Return a copy of self with the direction reversed"""
-        return Axis.from_occt(self.wrapped.Reversed())
+        return Axis(self.wrapped.Reversed())
 
     def __neg__(self) -> Axis:
         """Flip direction operator -"""
         return self.reverse()
+
+    def __and__(self: Plane, other: Union[Axis, Location, Plane, VectorLike, "Shape"]):
+        """intersect vector with other &"""
+        return self.intersect(other)
+
+    @overload
+    def intersect(self, vector: VectorLike) -> Union[Vector, None]:
+        """Find intersection of vector and axis"""
+
+    @overload
+    def intersect(self, location: Location) -> Union[Location, None]:
+        """Find intersection of location and axis"""
+
+    @overload
+    def intersect(self, axis: Axis) -> Union[Axis, None]:
+        """Find intersection of axis and axis"""
+
+    @overload
+    def intersect(self, plane: Plane) -> Union[Axis, None]:
+        """Find intersection of plane and axis"""
+
+    def intersect(self, *args, **kwargs):
+        axis, plane, vector, location, shape = _parse_intersect_args(*args, **kwargs)
+
+        if axis is not None:
+            if self.is_coaxial(axis):
+                return self
+            else:
+                # Extract points and directions to numpy arrays
+                p1 = np.array([*self.position])
+                d1 = np.array([*self.direction])
+                p2 = np.array([*axis.position])
+                d2 = np.array([*axis.direction])
+
+                # Compute the cross product of directions
+                cross_d1_d2 = np.cross(d1, d2)
+                cross_d1_d2_norm = np.linalg.norm(cross_d1_d2)
+
+                if cross_d1_d2_norm < TOLERANCE:
+                    # The directions are parallel
+                    return None
+
+                # Solve the system of equations to find the intersection
+                system_of_equations = np.array([d1, -d2, cross_d1_d2]).T
+                origin_diff = p2 - p1
+                try:
+                    t1, t2, _ = np.linalg.solve(system_of_equations, origin_diff)
+                except np.linalg.LinAlgError:
+                    return None  # The lines do not intersect
+
+                # Calculate the intersection point
+                intersection_point = p1 + t1 * d1
+                return Vector(*intersection_point)
+
+        elif plane is not None:
+            return plane.intersect(self)
+
+        elif vector is not None:
+            # Create a vector from the origin to the point
+            vec_to_point: Vector = vector - self.position
+
+            # Project the vector onto the direction of the axis
+            projected_length = vec_to_point.dot(self.direction)
+            projected_vec = self.direction * projected_length + self.position
+
+            # Calculate the difference between the original vector and the projected vector
+            if vector == projected_vec:
+                return vector
+
+        elif location is not None:
+            # Find the "direction" of the location
+            location_dir = Plane(location).z_dir
+
+            # Is the location on the axis with the same direction?
+            if (
+                self.intersect(location.position) is not None
+                and location_dir == self.direction
+            ):
+                return location
+
+        elif shape is not None:
+            return shape.intersect(self)
 
 
 class BoundBox:
@@ -821,8 +995,6 @@ class BoundBox:
             else:
                 BRepBndLib.AddOptimal_s(shape, bbox)
         else:
-            mesh = BRepMesh_IncrementalMesh(shape, tolerance, True)
-            mesh.Perform()
             # this is adds +margin but is faster
             if oriented:
                 BRepBndLib.AddOBB_s(shape, bbox_obb)
@@ -903,6 +1075,14 @@ class Color:
         """
 
     @overload
+    def __init__(self, color_tuple: tuple[float]):
+        """Color from a 3 or 4 tuple of float values
+
+        Args:
+            color_tuple (tuple[float]): _description_
+        """
+
+    @overload
     def __init__(self, color_code: int, alpha: int = 0xFF):
         """Color from a hexidecimal color code with an optional alpha value
 
@@ -913,17 +1093,19 @@ class Color:
 
     def __init__(self, *args, **kwargs):
         # pylint: disable=too-many-branches
-        red, green, blue, alpha, name, color_code, q_color = (
+        red, green, blue, alpha, color_tuple, name, color_code, q_color = (
             1.0,
             1.0,
             1.0,
             1.0,
+            None,
             None,
             None,
             None,
         )
-
-        if len(args) == 1 or len(args) == 2:
+        if len(args) == 1 and isinstance(args[0], tuple):
+            red, green, blue, alpha = args[0] + (1.0,) * (4 - len(args[0]))
+        elif len(args) == 1 or len(args) == 2:
             if isinstance(args[0], Quantity_ColorRGBA):
                 q_color = args[0]
             elif isinstance(args[0], int):
@@ -942,6 +1124,8 @@ class Color:
         red = kwargs.get("red", red)
         green = kwargs.get("green", green)
         blue = kwargs.get("blue", blue)
+        color_tuple = kwargs.get("color_tuple", color_tuple)
+
         if color_code is None:
             alpha = kwargs.get("alpha", alpha)
         else:
@@ -954,6 +1138,9 @@ class Color:
             red = red / 255
             green = green / 255
             blue = blue / 255
+
+        if color_tuple is not None:
+            red, green, blue, alpha = color_tuple + (1.0,) * (4 - len(color_tuple))
 
         if q_color is not None:
             self.wrapped = q_color
@@ -1296,10 +1483,10 @@ class Location:
     def __pow__(self, exponent: int) -> Location:
         return Location(self.wrapped.Powered(exponent))
 
-    def __eq__(self, other: Location) -> bool:
+    def __eq__(self, other: object) -> bool:
         """Compare Locations"""
         if not isinstance(other, Location):
-            raise ValueError("other must be a Location")
+            return NotImplemented
         quaternion1 = gp_Quaternion()
         quaternion1.SetEulerAngles(
             gp_EulerSequence.gp_Intrinsic_XYZ,
@@ -1319,6 +1506,10 @@ class Location:
     def __neg__(self) -> Location:
         """Flip the orientation without changing the position operator -"""
         return Location(-Plane(self))
+
+    def __and__(self: Plane, other: Union[Axis, Location, Plane, VectorLike, "Shape"]):
+        """intersect axis with other &"""
+        return self.intersect(other)
 
     def to_axis(self) -> Axis:
         """Convert the location into an Axis"""
@@ -1361,6 +1552,40 @@ class Location:
         position_str = ", ".join((f"{v:.2f}" for v in self.to_tuple()[0]))
         orientation_str = ", ".join((f"{v:.2f}" for v in self.to_tuple()[1]))
         return f"Location: (position=({position_str}), orientation=({orientation_str}))"
+
+    @overload
+    def intersect(self, vector: VectorLike) -> Union[Vector, None]:
+        """Find intersection of vector and location"""
+
+    @overload
+    def intersect(self, location: Location) -> Union[Location, None]:
+        """Find intersection of location and location"""
+
+    @overload
+    def intersect(self, axis: Axis) -> Union[Location, None]:
+        """Find intersection of axis and location"""
+
+    @overload
+    def intersect(self, plane: Plane) -> Union[Location, None]:
+        """Find intersection of plane and location"""
+
+    def intersect(self, *args, **kwargs):
+        axis, plane, vector, location, shape = _parse_intersect_args(*args, **kwargs)
+
+        if axis is not None:
+            return axis.intersect(self)
+
+        elif plane is not None:
+            return plane.intersect(self)
+
+        elif vector is not None and self.position == vector:
+            return vector
+
+        elif location is not None and self == location:
+            return self
+
+        elif shape is not None:
+            return shape.intersect(self)
 
 
 class LocationEncoder(json.JSONEncoder):
@@ -1710,6 +1935,15 @@ class PlaneMeta(type):
         """Bottom Plane"""
         return Plane((0, 0, 0), (1, 0, 0), (0, 0, -1))
 
+    @property
+    def isometric(cls) -> Plane:
+        """Isometric Plane"""
+        return Plane(
+            (0, 0, 0),
+            (1 / 2**0.5, 1 / 2**0.5, 0),
+            (1 / 3**0.5, -1 / 3**0.5, 1 / 3**0.5),
+        )
+
 
 class Plane(metaclass=PlaneMeta):
     """Plane
@@ -1724,22 +1958,23 @@ class Plane(metaclass=PlaneMeta):
 
     Planes can be created from faces as workplanes for feature creation on objects.
 
-    ======= ====== ====== ======
-    Name    x_dir  y_dir  z_dir
-    ======= ====== ====== ======
-    XY      +x     +y     +z
-    YZ      +y     +z     +x
-    ZX      +z     +x     +y
-    XZ      +x     +z     -y
-    YX      +y     +x     -z
-    ZY      +z     +y     -x
-    front   +x     +z     -y
-    back    -x     +z     +y
-    left    -y     +z     -x
-    right   +y     +z     +x
-    top     +x     +y     +z
-    bottom  +x     -y     -z
-    ======= ====== ====== ======
+    =========   ====== ======== ========
+    Name        x_dir  y_dir    z_dir
+    =========   ====== ======== ========
+    XY           +x     +y       +z
+    YZ           +y     +z       +x
+    ZX           +z     +x       +y
+    XZ           +x     +z       -y
+    YX           +y     +x       -z
+    ZY           +z     +y       -x
+    front        +x     +z       -y
+    back         -x     +z       +y
+    left         -y     +z       -x
+    right        +y     +z       +x
+    top          +x     +y       +z
+    bottom       +x     -y       -z
+    isometric    +x+y   -x+y+z   +x+y-z
+    =========   ====== ======== ========
 
     Args:
         gp_pln (gp_Pln): an OCCT plane object
@@ -1919,27 +2154,6 @@ class Plane(metaclass=PlaneMeta):
             origin=self.origin + self.z_dir * amount, x_dir=self.x_dir, z_dir=self.z_dir
         )
 
-    def _eq_iter(self, other: Plane):
-        """Iterator to successively test equality
-
-        Args:
-            other: Plane to compare to
-
-        Returns:
-            Are planes equal
-        """
-        # equality tolerances
-        eq_tolerance_origin = 1e-6
-        eq_tolerance_dot = 1e-6
-
-        yield isinstance(other, Plane)  # comparison is with another Plane
-        # origins are the same
-        yield abs(self._origin - other.origin) < eq_tolerance_origin
-        # z-axis vectors are parallel (assumption: both are unit vectors)
-        yield abs(self.z_dir.dot(other.z_dir) - 1) < eq_tolerance_dot
-        # x-axis vectors are parallel (assumption: both are unit vectors)
-        yield abs(self.x_dir.dot(other.x_dir) - 1) < eq_tolerance_dot
-
     def __copy__(self) -> Plane:
         """Return copy of self"""
         return Plane(gp_Pln(self.wrapped.Position()))
@@ -1948,13 +2162,23 @@ class Plane(metaclass=PlaneMeta):
         """Return deepcopy of self"""
         return Plane(gp_Pln(self.wrapped.Position()))
 
-    def __eq__(self, other: Plane):
+    def __eq__(self, other: object):
         """Are planes equal operator =="""
-        return all(self._eq_iter(other))
+        if not isinstance(other, Plane):
+            return NotImplemented
 
-    def __ne__(self, other: Plane):
-        """Are planes not equal operator !+"""
-        return not self.__eq__(other)
+        # equality tolerances
+        eq_tolerance_origin = 1e-6
+        eq_tolerance_dot = 1e-6
+
+        return (
+            # origins are the same
+            abs(self._origin - other.origin) < eq_tolerance_origin
+            # z-axis vectors are parallel (assumption: both are unit vectors)
+            and abs(self.z_dir.dot(other.z_dir) - 1) < eq_tolerance_dot
+            # x-axis vectors are parallel (assumption: both are unit vectors)
+            and abs(self.x_dir.dot(other.x_dir) - 1) < eq_tolerance_dot
+        )
 
     def __neg__(self) -> Plane:
         """Reverse z direction of plane operator -"""
@@ -1980,6 +2204,10 @@ class Plane(metaclass=PlaneMeta):
                 "Planes can only be multiplied with Locations or Shapes to relocate them"
             )
         return result
+
+    def __and__(self: Plane, other: Union[Axis, Location, Plane, VectorLike, "Shape"]):
+        """intersect plane with other &"""
+        return self.intersect(other)
 
     def __repr__(self):
         """To String
@@ -2040,7 +2268,7 @@ class Plane(metaclass=PlaneMeta):
             if not self.contains(locator):
                 raise ValueError(f"{locator} is not located within plane")
         elif isinstance(locator, Axis):
-            new_origin = self.find_intersection(locator)
+            new_origin = self.intersect(locator)
             if new_origin is None:
                 raise ValueError(f"{locator} doesn't intersect the plane")
         else:
@@ -2242,17 +2470,68 @@ class Plane(metaclass=PlaneMeta):
             return_value = self.wrapped.Contains(Vector(obj).to_pnt(), tolerance)
         return return_value
 
-    def find_intersection(self, axis: Axis) -> Union[Vector, None]:
+    @overload
+    def intersect(self, vector: VectorLike) -> Union[Vector, None]:
+        """Find intersection of vector and plane"""
+
+    @overload
+    def intersect(self, location: Location) -> Union[Location, None]:
+        """Find intersection of location and plane"""
+
+    @overload
+    def intersect(self, axis: Axis) -> Union[Axis, Vector, None]:
         """Find intersection of axis and plane"""
-        geom_line = Geom_Line(axis.wrapped)
-        geom_plane = Geom_Plane(self.local_coord_system)
 
-        intersection_calculator = GeomAPI_IntCS(geom_line, geom_plane)
+    @overload
+    def intersect(self, plane: Plane) -> Union[Axis, None]:
+        """Find intersection of plane and plane"""
 
-        if intersection_calculator.IsDone() and intersection_calculator.NbPoints() == 1:
-            # Get the intersection point
-            intersection_point = Vector(intersection_calculator.Point(1))
-        else:
-            intersection_point = None
+    @overload
+    def intersect(self, shape: "Shape") -> Union["Shape", None]:
+        """Find intersection of plane and shape"""
 
-        return intersection_point
+    def intersect(self, *args, **kwargs):
+
+        axis, plane, vector, location, shape = _parse_intersect_args(*args, **kwargs)
+
+        if axis is not None:
+            if self.contains(axis):
+                return axis
+            else:
+                geom_line = Geom_Line(axis.wrapped)
+                geom_plane = Geom_Plane(self.local_coord_system)
+
+                intersection_calculator = GeomAPI_IntCS(geom_line, geom_plane)
+
+                if (
+                    intersection_calculator.IsDone()
+                    and intersection_calculator.NbPoints() == 1
+                ):
+                    # Get the intersection point
+                    intersection_point = Vector(intersection_calculator.Point(1))
+                else:
+                    intersection_point = None
+
+                return intersection_point
+
+        elif plane is not None:
+            surface1 = Geom_Plane(self.wrapped)
+            surface2 = Geom_Plane(plane.wrapped)
+            intersector = GeomAPI_IntSS(surface1, surface2, TOLERANCE)
+            if intersector.IsDone() and intersector.NbLines() > 0:
+                # Get the intersection line (axis)
+                intersection_line = intersector.Line(1)
+                # Extract the axis from the intersection line
+                axis = intersection_line.Position()
+                return Axis(axis)
+
+        elif vector is not None and self.contains(vector):
+            return vector
+
+        elif location is not None:
+            pln = Plane(location)
+            if pln.origin == self.origin and pln.z_dir == self.z_dir:
+                return location
+
+        elif shape is not None:
+            return shape.intersect(self)
