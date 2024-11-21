@@ -54,7 +54,14 @@ from typing import Any, Callable, Iterable, Optional, Union, TypeVar
 from typing_extensions import Self, ParamSpec, Concatenate
 
 from build123d.build_enums import Align, Mode, Select, Unit
-from build123d.geometry import Axis, Location, Plane, Vector, VectorLike
+from build123d.geometry import (
+    Axis,
+    Location,
+    Plane,
+    Vector,
+    VectorLike,
+    to_align_offset,
+)
 from build123d.topology import (
     Compound,
     Curve,
@@ -224,6 +231,8 @@ class Builder(ABC):
         assert current_frame is not None
         assert current_frame.f_back is not None
         self._python_frame = current_frame.f_back.f_back
+        self._python_frame_code = self._python_frame.f_code
+        self.parent_frame = None
         self.builder_parent = None
         self.lasts: dict = {Vertex: [], Edge: [], Face: [], Solid: []}
         self.workplanes_context = None
@@ -280,7 +289,10 @@ class Builder(ABC):
                 "Transferring object(s) to %s", type(self.builder_parent).__name__
             )
             if self._obj is None and not sys.exc_info()[1]:
-                warnings.warn(f"{self._obj_name} is None - {self._tag} didn't create anything", stacklevel=2)
+                warnings.warn(
+                    f"{self._obj_name} is None - {self._tag} didn't create anything",
+                    stacklevel=2,
+                )
             self.builder_parent._add_to_context(self._obj, mode=self.mode)
 
         self.exit_workplanes = WorkplaneList._get_context().workplanes
@@ -381,7 +393,7 @@ class Builder(ABC):
                                 x_dir=(1, 0, 0),
                                 z_dir=new_face.normal_at(),
                             )
-                        except:
+                        except Exception:
                             plane = Plane(origin=(0, 0, 0), z_dir=new_face.normal_at())
 
                         new_face = plane.to_local_coords(new_face)
@@ -516,7 +528,10 @@ class Builder(ABC):
         all_vertices = self.vertices(select)
         vertex_count = len(all_vertices)
         if vertex_count != 1:
-            warnings.warn(f"Found {vertex_count} vertices, returning first")
+            warnings.warn(
+                f"Found {vertex_count} vertices, returning first",
+                stacklevel=2,
+            )
         return all_vertices[0]
 
     def edges(self, select: Select = Select.ALL) -> ShapeList[Edge]:
@@ -556,7 +571,10 @@ class Builder(ABC):
         all_edges = self.edges(select)
         edge_count = len(all_edges)
         if edge_count != 1:
-            warnings.warn(f"Found {edge_count} edges, returning first")
+            warnings.warn(
+                f"Found {edge_count} edges, returning first",
+                stacklevel=2,
+            )
         return all_edges[0]
 
     def wires(self, select: Select = Select.ALL) -> ShapeList[Wire]:
@@ -596,7 +614,10 @@ class Builder(ABC):
         all_wires = self.wires(select)
         wire_count = len(all_wires)
         if wire_count != 1:
-            warnings.warn(f"Found {wire_count} wires, returning first")
+            warnings.warn(
+                f"Found {wire_count} wires, returning first",
+                stacklevel=2,
+            )
         return all_wires[0]
 
     def faces(self, select: Select = Select.ALL) -> ShapeList[Face]:
@@ -636,7 +657,10 @@ class Builder(ABC):
         all_faces = self.faces(select)
         face_count = len(all_faces)
         if face_count != 1:
-            warnings.warn(f"Found {face_count} faces, returning first")
+            warnings.warn(
+                f"Found {face_count} faces, returning first",
+                stacklevel=2,
+            )
         return all_faces[0]
 
     def solids(self, select: Select = Select.ALL) -> ShapeList[Solid]:
@@ -676,7 +700,10 @@ class Builder(ABC):
         all_solids = self.solids(select)
         solid_count = len(all_solids)
         if solid_count != 1:
-            warnings.warn(f"Found {solid_count} solids, returning first")
+            warnings.warn(
+                f"Found {solid_count} solids, returning first",
+                stacklevel=2,
+            )
         return all_solids[0]
 
     def _shapes(self, obj_type: Union[Vertex, Edge, Face, Solid] = None) -> ShapeList:
@@ -943,14 +970,7 @@ class HexLocations(LocationList):
         min_corner = Vector(sorted_points[0][0].X, sorted_points[1][0].Y)
 
         # Calculate the amount to offset the array to align it
-        align_offset = []
-        for i in range(2):
-            if self.align[i] == Align.MIN:
-                align_offset.append(0)
-            elif self.align[i] == Align.CENTER:
-                align_offset.append(-size[i] / 2)
-            elif self.align[i] == Align.MAX:
-                align_offset.append(-size[i])
+        align_offset = to_align_offset((0, 0), size, align)
 
         # Align the points
         points = ShapeList(
@@ -1143,29 +1163,22 @@ class GridLocations(LocationList):
         size = [x_spacing * (x_count - 1), y_spacing * (y_count - 1)]
         self.size = Vector(*size)  #: size of the grid
 
-        align_offset = []
-        for i in range(2):
-            if self.align[i] == Align.MIN:
-                align_offset.append(0.0)
-            elif self.align[i] == Align.CENTER:
-                align_offset.append(-size[i] / 2)
-            elif self.align[i] == Align.MAX:
-                align_offset.append(-size[i])
+        align_offset = to_align_offset((0, 0), size, align)
 
-        self.min = Vector(*align_offset)  #: bottom left corner
+        self.min = align_offset  #: bottom left corner
         self.max = self.min + self.size  #: top right corner
 
         # Create the list of local locations
-        local_locations = []
-        for i, j in product(range(x_count), range(y_count)):
-            local_locations.append(
-                Location(
-                    Vector(
-                        i * x_spacing + align_offset[0],
-                        j * y_spacing + align_offset[1],
-                    )
+        local_locations = [
+            Location(
+                align_offset
+                + Vector(
+                    i * x_spacing,
+                    j * y_spacing,
                 )
             )
+            for i, j in product(range(x_count), range(y_count))
+        ]
 
         self.local_locations = Locations._move_to_existing(
             local_locations
@@ -1286,7 +1299,7 @@ T2 = TypeVar("T2")
 
 
 def __gen_context_component_getter(
-    func: Callable[Concatenate[Builder, P], T2]
+    func: Callable[Concatenate[Builder, P], T2],
 ) -> Callable[P, T2]:
     @functools.wraps(func)
     def getter(select: Select = Select.ALL):

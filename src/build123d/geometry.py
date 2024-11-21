@@ -51,16 +51,14 @@ from typing import (
     overload,
     TypeVar,
 )
-from typing_extensions import deprecated
 
 from OCP.Bnd import Bnd_Box, Bnd_OBB
 from OCP.BRep import BRep_Tool
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face  # used for mass calculation
-from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRepTools import BRepTools
-from OCP.Geom import Geom_Line, Geom_Plane
+from OCP.Geom import Geom_BoundedSurface, Geom_Line, Geom_Plane
 from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf, GeomAPI_IntCS, GeomAPI_IntSS
 from OCP.gp import (
     gp_Ax1,
@@ -84,7 +82,7 @@ from OCP.Quantity import Quantity_Color, Quantity_ColorRGBA
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS_Face, TopoDS_Shape, TopoDS_Vertex
 
-from build123d.build_enums import Align, Intrinsic, Extrinsic
+from build123d.build_enums import Align, Align2DType, Align3DType, Intrinsic, Extrinsic
 
 # Create a build123d logger to distinguish these logs from application logs.
 # If the user doesn't configure logging, all build123d logs will be discarded.
@@ -1021,19 +1019,9 @@ class BoundBox:
             and second_box.max.Z < self.max.Z
         )
 
-    def to_align_offset(self, align: Tuple[float, float]) -> Tuple[float, float]:
+    def to_align_offset(self, align: Union[Align2DType, Align3DType]) -> Vector:
         """Amount to move object to achieve the desired alignment"""
-        align_offset = []
-        for i in range(2):
-            if align[i] == Align.MIN:
-                align_offset.append(-self.min.to_tuple()[i])
-            elif align[i] == Align.CENTER:
-                align_offset.append(
-                    -(self.min.to_tuple()[i] + self.max.to_tuple()[i]) / 2
-                )
-            elif align[i] == Align.MAX:
-                align_offset.append(-self.max.to_tuple()[i])
-        return align_offset
+        return to_align_offset(self.min.to_tuple(), self.max.to_tuple(), align)
 
 
 class Color:
@@ -2092,18 +2080,19 @@ class Plane(metaclass=PlaneMeta):
         elif arg_face:
             # Determine if face is planar
             surface = BRep_Tool.Surface_s(arg_face.wrapped)
-            if not isinstance(surface, Geom_Plane):
+            if not arg_face.is_planar:
                 raise ValueError("Planes can only be created from planar faces")
             properties = GProp_GProps()
             BRepGProp.SurfaceProperties_s(arg_face.wrapped, properties)
             self._origin = Vector(properties.CentreOfMass())
-            self.x_dir = (
-                Vector(arg_x_dir)
-                if arg_x_dir
-                else Vector(
-                    BRep_Tool.Surface_s(arg_face.wrapped).Position().XDirection()
-                )
-            )
+            if isinstance(surface, Geom_BoundedSurface):
+                point = gp_Pnt()
+                face_x_dir = gp_Vec()
+                tangent_v = gp_Vec()
+                surface.D1(0.5, 0.5, point, face_x_dir, tangent_v)
+            else:
+                face_x_dir = surface.Position().XDirection()
+            self.x_dir = Vector(arg_x_dir) if arg_x_dir else Vector(face_x_dir)
             self.x_dir = Vector(round(i, 14) for i in self.x_dir)
             self.z_dir = Plane.get_topods_face_normal(arg_face.wrapped)
             self.z_dir = Vector(round(i, 14) for i in self.z_dir)
@@ -2535,3 +2524,41 @@ class Plane(metaclass=PlaneMeta):
 
         elif shape is not None:
             return shape.intersect(self)
+
+
+def to_align_offset(
+    min_point: VectorLike,
+    max_point: VectorLike,
+    align: Union[Align2DType, Align3DType],
+    center: Optional[VectorLike] = None,
+) -> Vector:
+    """Amount to move object to achieve the desired alignment"""
+    align_offset = []
+
+    if center is None:
+        center = (Vector(min_point) + Vector(max_point)) / 2
+
+    if align is None or align is Align.NONE:
+        return Vector(0, 0, 0)
+    if align is Align.MIN:
+        return -Vector(min_point)
+    if align is Align.MAX:
+        return -Vector(max_point)
+    if align is Align.CENTER:
+        return -Vector(center)
+
+    for alignment, min_coord, max_coord, center_coord in zip(
+        map(Align, align),
+        min_point,
+        max_point,
+        center,
+    ):
+        if alignment == Align.MIN:
+            align_offset.append(-min_coord)
+        elif alignment == Align.CENTER:
+            align_offset.append(-center_coord)
+        elif alignment == Align.MAX:
+            align_offset.append(-max_coord)
+        elif alignment == Align.NONE:
+            align_offset.append(0)
+    return Vector(*align_offset)

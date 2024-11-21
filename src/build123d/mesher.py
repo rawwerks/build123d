@@ -83,14 +83,15 @@ license:
 # pylint: disable=no-name-in-module, import-error
 import copy
 import ctypes
-import itertools
 import math
 import os
 import sys
 import uuid
 import warnings
+from os import PathLike, fsdecode
 from typing import Iterable, Union
 
+import OCP.TopAbs as ta
 from OCP.BRep import BRep_Tool
 from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_MakeFace,
@@ -101,18 +102,16 @@ from OCP.BRepBuilderAPI import (
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.gp import gp_Pnt
-import OCP.TopAbs as ta
 from OCP.GProp import GProp_GProps
-from OCP.ShapeFix import ShapeFix_Shape
 from OCP.TopAbs import TopAbs_ShapeEnum
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopoDS import TopoDS_Compound
 from OCP.TopLoc import TopLoc_Location
-
+from OCP.TopoDS import TopoDS_Compound
 from py_lib3mf import Lib3MF
+
 from build123d.build_enums import MeshType, Unit
-from build123d.geometry import Color, TOLERANCE, Vector
-from build123d.topology import Compound, Face, Shape, Shell, Solid, downcast
+from build123d.geometry import TOLERANCE, Color
+from build123d.topology import Compound, Shape, Shell, Solid, downcast
 
 
 class Mesher:
@@ -400,7 +399,10 @@ class Mesher:
 
             # Skip invalid meshes
             if len(ocp_mesh_vertices) < 3 or not triangles:
-                warnings.warn(f"Degenerate shape {b3d_shape} - skipped")
+                warnings.warn(
+                    f"Degenerate shape {b3d_shape} - skipped",
+                    stacklevel=2,
+                )
                 continue
 
             # Create 3mf mesh inputs
@@ -429,7 +431,7 @@ class Mesher:
             if not mesh_3mf.IsValid():
                 raise RuntimeError("3mf mesh is invalid")
             if not mesh_3mf.IsManifoldAndOriented():
-                warnings.warn("3mf mesh is not manifold")
+                warnings.warn("3mf mesh is not manifold", stacklevel=2)
 
             # Add mesh to model
             self.meshes.append(mesh_3mf)
@@ -481,11 +483,11 @@ class Mesher:
 
         return shape_obj
 
-    def read(self, file_name: str) -> list[Shape]:
+    def read(self, file_name: Union[PathLike, str, bytes]) -> list[Shape]:
         """read
 
         Args:
-            file_name (str): file path
+            file_name Union[PathLike, str, bytes]: file path
 
         Raises:
             ValueError: Unknown file format - must be 3mf or stl
@@ -493,10 +495,11 @@ class Mesher:
         Returns:
             list[Shape]: build123d shapes extracted from mesh file
         """
-        input_file_format = file_name.split(".")[-1].lower()
-        if input_file_format not in ["3mf", "stl"]:
-            raise ValueError(f"Unknown file format {input_file_format}")
-        reader = self.model.QueryReader(input_file_format)
+        file_name = fsdecode(file_name)
+        _, input_file_extension = os.path.splitext(file_name)
+        if input_file_extension not in [".3mf", ".stl"]:
+            raise ValueError(f"Unknown file format {input_file_extension}")
+        reader = self.model.QueryReader(input_file_extension[1:])
         reader.ReadFromFile(file_name)
         self.unit = Mesher._map_3mf_to_b3d_unit[self.model.GetUnit()]
 
@@ -524,17 +527,18 @@ class Mesher:
 
         return shapes
 
-    def write(self, file_name: str):
+    def write(self, file_name: Union[PathLike, str, bytes]):
         """write
 
         Args:
-            file_name (str): file path
+            file_name Union[Pathlike, str, bytes]: file path
 
         Raises:
             ValueError: Unknown file format - must be 3mf or stl
         """
-        output_file_format = file_name.split(".")[-1].lower()
-        if output_file_format not in ["3mf", "stl"]:
-            raise ValueError(f"Unknown file format {output_file_format}")
-        writer = self.model.QueryWriter(output_file_format)
+        file_name = fsdecode(file_name)
+        _, output_file_extension = os.path.splitext(file_name)
+        if output_file_extension not in [".3mf", ".stl"]:
+            raise ValueError(f"Unknown file format {output_file_extension}")
+        writer = self.model.QueryWriter(output_file_extension[1:])
         writer.WriteToFile(file_name)

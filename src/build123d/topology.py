@@ -170,7 +170,6 @@ from OCP.Geom2dAPI import Geom2dAPI_InterCurveCurve
 from OCP.GeomAbs import GeomAbs_C0, GeomAbs_Intersection, GeomAbs_JoinType
 from OCP.GeomAPI import (
     GeomAPI_Interpolate,
-    GeomAPI_IntCS,
     GeomAPI_PointsToBSpline,
     GeomAPI_PointsToBSplineSurface,
     GeomAPI_ProjectPointOnSurf,
@@ -181,6 +180,7 @@ from OCP.GeomFill import (
     GeomFill_Frenet,
     GeomFill_TrihedronLaw,
 )
+from OCP.GeomLib import GeomLib_IsPlanarSurface
 from OCP.gp import (
     gp_Ax1,
     gp_Ax2,
@@ -365,6 +365,8 @@ geom_LUT_EDGE: Dict[ga.GeomAbs_CurveType, GeomType] = {
 
 Shapes = Literal["Vertex", "Edge", "Wire", "Face", "Shell", "Solid", "Compound"]
 
+TrimmingTool = Union[Plane, "Shell", "Face"]
+
 
 def tuplify(obj: Any, dim: int) -> tuple:
     """Create a size tuple"""
@@ -379,6 +381,46 @@ def tuplify(obj: Any, dim: int) -> tuple:
 
 class Mixin1D:
     """Methods to add to the Edge and Wire classes"""
+
+    def __add__(self, other: Union[list[Shape], Shape]) -> Self:
+        """fuse shape to wire/edge operator +"""
+
+        # Convert `other` to list of base objects and filter out None values
+        summands = [
+            shape
+            for o in (other if isinstance(other, (list, tuple)) else [other])
+            if o is not None
+            for shape in o.get_top_level_shapes()
+        ]
+        # If there is nothing to add return the original object
+        if not summands:
+            return self
+
+        if not all(summand._dim == 1 for summand in summands):
+            raise ValueError("Only shapes with the same dimension can be added")
+
+        summand_edges = [e for summand in summands for e in summand.edges()]
+        if self.wrapped is None:  # an empty object
+            if len(summands) == 1:
+                sum_shape = summands[0]
+            else:
+                try:
+                    sum_shape = Wire(summand_edges)
+                except Exception:
+                    sum_shape = summands[0].fuse(*summands[1:])
+        else:
+            try:
+                sum_shape = Wire(self.edges() + summand_edges)
+            except Exception:
+                sum_shape = self.fuse(*summands)
+
+        if SkipClean.clean:
+            sum_shape = sum_shape.clean()
+
+        # If there is only one Edge, return that
+        sum_shape = sum_shape.edge() if len(sum_shape.edges()) == 1 else sum_shape
+
+        return sum_shape
 
     def start_point(self) -> Vector:
         """The start point of this edge
@@ -450,7 +492,7 @@ class Mixin1D:
         else:
             try:
                 pnt = Vector(position)
-            except:
+            except Exception:
                 raise ValueError("position must be a float or a point")
             # GeomAPI_ProjectPointOnCurve only works with Edges so find
             # the closest Edge if the shape has multiple Edges.
@@ -1480,29 +1522,34 @@ class Shape(NodeMixin):
         """Set the shape's color"""
         self._color = value
 
-    def copy_attributes_to(self, target: Shape, attributes: list[str]):
-        """Copy object attributes to target
+    def copy_attributes_to(self, target: Shape, exceptions: Iterable[str] = None):
+        """Copy common object attributes to target
+
+        Note that preset attributes of target will not be overridden.
 
         Args:
             target (Shape): object to gain attributes
-            attributes (list[str]): attributes to copy
+            exceptions (Iterable[str], optional): attributes not to copy
 
         Raises:
             ValueError: invalid attribute
         """
-        for attr in attributes:
-            # Check if both 'self' and 'target' have the attribute
-            if hasattr(self, attr):
-                if hasattr(target, attr):
-                    # Copy the attribute only if the target's attribute not set
-                    if not getattr(target, attr):
-                        setattr(target, attr, getattr(self, attr))
-                elif getattr(self, attr):
-                    warnings.warn(
-                        f"Target does not have attribute '{attr}', skipping copy."
-                    )
-            else:
-                raise ValueError(f"Source does not have attribute '{attr}'")
+        # Find common attributes and eliminate exceptions
+        attrs1 = set(self.__dict__.keys())
+        attrs2 = set(target.__dict__.keys())
+        common_attrs = attrs1 & attrs2
+        if exceptions is not None:
+            common_attrs -= set(exceptions)
+
+        for attr in common_attrs:
+            # Copy the attribute only if the target's attribute not set
+            if not getattr(target, attr):
+                setattr(target, attr, getattr(self, attr))
+            # Attach joints to the new part
+            if attr == "joints":
+                joint: Joint
+                for joint in target.joints.values():
+                    joint.parent = target
 
     @property
     def is_manifold(self) -> bool:
@@ -1698,64 +1745,73 @@ class Shape(NodeMixin):
 
     def __add__(self, other: Union[list[Shape], Shape]) -> Self:
         """fuse shape to self operator +"""
-        others = other if isinstance(other, (list, tuple)) else [other]
+        # Convert `other` to list of base objects and filter out None values
+        summands = [
+            shape
+            for o in (other if isinstance(other, (list, tuple)) else [other])
+            if o is not None
+            for shape in o.get_top_level_shapes()
+        ]
+        # If there is nothing to add return the original object
+        if not summands:
+            return self
 
-        if not all([type(other)._dim == type(self)._dim for other in others]):
+        # Check that all dimensions are the same
+        addend_dim = self._dim
+        if addend_dim is None:
+            raise ValueError("Dimensions of objects to add to are inconsistent")
+
+        if not all(summand._dim == addend_dim for summand in summands):
             raise ValueError("Only shapes with the same dimension can be added")
 
-        if self.wrapped is None:
-            if len(others) == 1:
-                new_shape = others[0]
+        if self.wrapped is None:  # an empty object
+            if len(summands) == 1:
+                sum_shape = summands[0]
             else:
-                new_shape = others[0].fuse(*others[1:])
-        elif isinstance(other, Shape) and other.wrapped is None:
-            new_shape = self
+                sum_shape = summands[0].fuse(*summands[1:])
         else:
-            new_shape = self.fuse(*others)
+            sum_shape = self.fuse(*summands)
 
         if SkipClean.clean:
-            new_shape = new_shape.clean()
+            sum_shape = sum_shape.clean()
 
-        if self._dim == 3:
-            new_shape = Part(new_shape.wrapped)
-        elif self._dim == 2:
-            new_shape = Sketch(new_shape.wrapped)
-        elif self._dim == 1:
-            new_shape = Curve(Compound(new_shape.edges()).wrapped)
+        return sum_shape
 
-        return new_shape
-
-    def __sub__(self, other: Shape) -> Self:
+    def __sub__(self, other: Union[Shape, Iterable[Shape]]) -> Self:
         """cut shape from self operator -"""
-        others = other if isinstance(other, (list, tuple)) else [other]
 
-        for _other in others:
-            if type(_other)._dim < type(self)._dim:
-                raise ValueError(
-                    f"Only shapes with equal or greater dimension can be subtracted: "
-                    f"not {type(self).__name__} ({type(self)._dim}D) and "
-                    f"{type(_other).__name__} ({type(_other)._dim}D)"
-                )
-
-        new_shape = None
         if self.wrapped is None:
             raise ValueError("Cannot subtract shape from empty compound")
-        if isinstance(other, Shape) and other.wrapped is None:
-            new_shape = self
-        else:
-            new_shape = self.cut(*others)
 
-        if new_shape is not None and SkipClean.clean:
-            new_shape = new_shape.clean()
+        # Convert `other` to list of base objects and filter out None values
+        subtrahends = [
+            shape
+            for o in (other if isinstance(other, (list, tuple)) else [other])
+            if o is not None
+            for shape in o.get_top_level_shapes()
+        ]
+        # If there is nothing to subtract return the original object
+        if not subtrahends:
+            return self
 
-        if self._dim == 3:
-            new_shape = Part(new_shape.wrapped)
-        elif self._dim == 2:
-            new_shape = Sketch(new_shape.wrapped)
-        elif self._dim == 1:
-            new_shape = Curve(Compound(new_shape.edges()).wrapped)
+        # Check that all dimensions are the same
+        minuend_dim = self._dim
+        if minuend_dim is None:
+            raise ValueError("Dimensions of objects to subtract from are inconsistent")
 
-        return new_shape
+        # Check that the operation is valid
+        subtrahend_dims = [s._dim for s in subtrahends]
+        if any(d < minuend_dim for d in subtrahend_dims):
+            raise ValueError(
+                f"Only shapes with equal or greater dimension can be subtracted: "
+                f"not {type(self).__name__} ({minuend_dim}D) and "
+                f"{type(other).__name__} ({min(subtrahend_dims)}D)"
+            )
+
+        # Do the actual cut operation
+        difference = self.cut(*subtrahends)
+
+        return difference
 
     def __and__(self, other: Shape) -> Self:
         """intersect shape with self operator &"""
@@ -1767,13 +1823,6 @@ class Shape(NodeMixin):
 
         if new_shape.wrapped is not None and SkipClean.clean:
             new_shape = new_shape.clean()
-
-        if self._dim == 3:
-            new_shape = Part(new_shape.wrapped)
-        elif self._dim == 2:
-            new_shape = Sketch(new_shape.wrapped)
-        elif self._dim == 1:
-            new_shape = Curve(Compound(new_shape.edges()).wrapped)
 
         return new_shape
 
@@ -1806,8 +1855,8 @@ class Shape(NodeMixin):
         try:
             upgrader.Build()
             self.wrapped = downcast(upgrader.Shape())
-        except:  # pylint: disable=bare-except
-            warnings.warn(f"Unable to clean {self}")
+        except Exception:
+            warnings.warn(f"Unable to clean {self}", stacklevel=2)
         return self
 
     def fix(self) -> Self:
@@ -2151,49 +2200,130 @@ class Shape(NodeMixin):
 
         return out
 
+    def get_top_level_shapes(self) -> ShapeList[Shape]:
+        """
+        Retrieve the first level of child shapes from the shape.
+
+        This method collects all the non-compound shapes directly contained in the
+        current shape. If the wrapped shape is a `TopoDS_Compound`, it traverses
+        its immediate children and collects all shapes that are not further nested
+        compounds. Nested compounds are traversed to gather their non-compound elements
+        without returning the nested compound itself.
+
+        Returns:
+            ShapeList[Shape]: A list of all first-level non-compound child shapes.
+
+        Example:
+            If the current shape is a compound containing both simple shapes
+            (e.g., edges, vertices) and other compounds, the method returns a list
+            of only the simple shapes directly contained at the top level.
+        """
+        if self.wrapped is None:
+            return ShapeList()
+
+        first_level_shapes = []
+        stack = [self]
+
+        while stack:
+            current_shape = stack.pop()
+            if isinstance(current_shape.wrapped, TopoDS_Compound):
+                iterator = TopoDS_Iterator()
+                iterator.Initialize(current_shape.wrapped)
+                while iterator.More():
+                    child_shape = Shape.cast(iterator.Value())
+                    if isinstance(child_shape.wrapped, TopoDS_Compound):
+                        # Traverse further into the compound
+                        stack.append(child_shape)
+                    else:
+                        # Add non-compound shape
+                        first_level_shapes.append(child_shape)
+                    iterator.Next()
+            else:
+                first_level_shapes.append(current_shape)
+
+        return ShapeList(first_level_shapes)
+
+    @staticmethod
+    def _get_shape_list(shape: Shape, entity_type: str) -> ShapeList:
+        """Helper to extract entities of a specific type from a shape."""
+        if shape.wrapped is None:
+            return ShapeList()
+        shape_list = ShapeList([Shape.cast(i) for i in shape._entities(entity_type)])
+        for item in shape_list:
+            item.topo_parent = shape
+        return shape_list
+
+    @staticmethod
+    def _get_single_shape(shape: Shape, entity_type: str) -> Shape:
+        """Helper to extract a single entity of a specific type from a shape,
+        with a warning if count != 1."""
+        shape_list = Shape._get_shape_list(shape, entity_type)
+        entity_count = len(shape_list)
+        if entity_count != 1:
+            warnings.warn(
+                f"Found {entity_count} {entity_type.lower()}s, returning first",
+                stacklevel=2,
+            )
+        return shape_list[0] if shape_list else None
+
     def vertices(self) -> ShapeList[Vertex]:
         """vertices - all the vertices in this Shape"""
-        vertex_list = ShapeList(
-            [Vertex(downcast(i)) for i in self._entities(Vertex.__name__)]
-        )
-        for vertex in vertex_list:
-            vertex.topo_parent = self
-        return vertex_list
+        return Shape._get_shape_list(self, "Vertex")
 
     def vertex(self) -> Vertex:
         """Return the Vertex"""
-        vertices = self.vertices()
-        vertex_count = len(vertices)
-        if vertex_count != 1:
-            warnings.warn(f"Found {vertex_count} vertices, returning first")
-        return vertices[0]
+        return Shape._get_single_shape(self, "Vertex")
 
     def edges(self) -> ShapeList[Edge]:
         """edges - all the edges in this Shape"""
-        edge_list = ShapeList(
-            [
-                Edge(i)
-                for i in self._entities(Edge.__name__)
-                if not BRep_Tool.Degenerated_s(TopoDS.Edge_s(i))
-            ]
+        edge_list = Shape._get_shape_list(self, "Edge")
+        return edge_list.filter_by(
+            lambda e: BRep_Tool.Degenerated_s(e.wrapped), reverse=True
         )
-        for edge in edge_list:
-            edge.topo_parent = self
-        return edge_list
 
     def edge(self) -> Edge:
         """Return the Edge"""
-        edges = self.edges()
-        edge_count = len(edges)
-        if edge_count != 1:
-            warnings.warn(f"Found {edge_count} edges, returning first")
-        return edges[0]
+        return Shape._get_single_shape(self, "Edge")
+
+    def wires(self) -> ShapeList[Wire]:
+        """wires - all the wires in this Shape"""
+        return Shape._get_shape_list(self, "Wire")
+
+    def wire(self) -> Wire:
+        """Return the Wire"""
+        return Shape._get_single_shape(self, "Wire")
+
+    def faces(self) -> ShapeList[Face]:
+        """faces - all the faces in this Shape"""
+        return Shape._get_shape_list(self, "Face")
+
+    def face(self) -> Face:
+        """Return the Face"""
+        return Shape._get_single_shape(self, "Face")
+
+    def shells(self) -> ShapeList[Shell]:
+        """shells - all the shells in this Shape"""
+        return Shape._get_shape_list(self, "Shell")
+
+    def shell(self) -> Shell:
+        """Return the Shell"""
+        return Shape._get_single_shape(self, "Shell")
+
+    def solids(self) -> ShapeList[Solid]:
+        """solids - all the solids in this Shape"""
+        return Shape._get_shape_list(self, "Solid")
+
+    def solid(self) -> Solid:
+        """Return the Solid"""
+        return Shape._get_single_shape(self, "Solid")
 
     def compounds(self) -> ShapeList[Compound]:
         """compounds - all the compounds in this Shape"""
-        if isinstance(self, Compound):
+        if self.wrapped is None:
+            return ShapeList()
+        if isinstance(self.wrapped, TopoDS_Compound):
             # pylint: disable=not-an-iterable
-            sub_compounds = [c for c in self if isinstance(c, Compound)]
+            sub_compounds = [c for c in self if isinstance(c.wrapped, TopoDS_Compound)]
             sub_compounds.append(self)
         else:
             sub_compounds = []
@@ -2201,63 +2331,14 @@ class Shape(NodeMixin):
 
     def compound(self) -> Compound:
         """Return the Compound"""
-        compounds = self.compounds()
-        compound_count = len(compounds)
-        if compound_count != 1:
-            warnings.warn(f"Found {compound_count} compounds, returning first")
-        return compounds[0]
-
-    def wires(self) -> ShapeList[Wire]:
-        """wires - all the wires in this Shape"""
-        return ShapeList([Wire(i) for i in self._entities(Wire.__name__)])
-
-    def wire(self) -> Wire:
-        """Return the Wire"""
-        wires = self.wires()
-        wire_count = len(wires)
-        if wire_count != 1:
-            warnings.warn(f"Found {wire_count} wires, returning first")
-        return wires[0]
-
-    def faces(self) -> ShapeList[Face]:
-        """faces - all the faces in this Shape"""
-        face_list = ShapeList([Face(i) for i in self._entities(Face.__name__)])
-        for face in face_list:
-            face.topo_parent = self
-        return face_list
-
-    def face(self) -> Face:
-        """Return the Face"""
-        faces = self.faces()
-        face_count = len(faces)
-        if face_count != 1:
-            msg = f"Found {face_count} faces, returning first"
-            warnings.warn(msg)
-        return faces[0]
-
-    def shells(self) -> ShapeList[Shell]:
-        """shells - all the shells in this Shape"""
-        return ShapeList([Shell(i) for i in self._entities(Shell.__name__)])
-
-    def shell(self) -> Shell:
-        """Return the Shell"""
-        shells = self.shells()
-        shell_count = len(shells)
-        if shell_count != 1:
-            warnings.warn(f"Found {shell_count} shells, returning first")
-        return shells[0]
-
-    def solids(self) -> ShapeList[Solid]:
-        """solids - all the solids in this Shape"""
-        return ShapeList([Solid(i) for i in self._entities(Solid.__name__)])
-
-    def solid(self) -> Solid:
-        """Return the Solid"""
-        solids = self.solids()
-        solid_count = len(solids)
-        if solid_count != 1:
-            warnings.warn(f"Found {solid_count} solids, returning first")
-        return solids[0]
+        shape_list = self.compounds()
+        entity_count = len(shape_list)
+        if entity_count != 1:
+            warnings.warn(
+                f"Found {entity_count} compounds, returning first",
+                stacklevel=2,
+            )
+        return shape_list[0] if shape_list else None
 
     @property
     def area(self) -> float:
@@ -2497,7 +2578,7 @@ class Shape(NodeMixin):
             trsf.SetDisplacement(new_ax, old_ax)
             builder = BRepBuilderAPI_Transform(self.wrapped, trsf, True, True)
 
-            self.wrapped = builder.Shape()
+            self.wrapped = downcast(builder.Shape())
             self.wrapped.Location(loc.wrapped)
 
     def distance_to_with_closest_points(
@@ -2559,7 +2640,16 @@ class Shape(NodeMixin):
         operation.SetRunParallel(True)
         operation.Build()
 
-        return Shape.cast(operation.Shape())
+        result = downcast(operation.Shape())
+        # Remove unnecessary TopoDS_Compound around single shape
+        if isinstance(result, TopoDS_Compound):
+            result = unwrap_topods_compound(result, True)
+        result = Shape.cast(result)
+
+        base = args[0] if isinstance(args, (list, tuple)) else args
+        base.copy_attributes_to(result, ["wrapped", "_NodeMixin__children"])
+
+        return result
 
     def cut(self, *to_cut: Shape) -> Self:
         """Remove the positional arguments from this Shape.
@@ -2730,7 +2820,7 @@ class Shape(NodeMixin):
 
         return ShapeList([Face(face) for face in faces])
 
-    def split(self, surface: Union[Plane, Face], keep: Keep = Keep.TOP) -> Self:
+    def split(self, tool: TrimmingTool, keep: Keep = Keep.TOP) -> Self:
         """split
 
         Split this shape by the provided plane or face.
@@ -2746,13 +2836,11 @@ class Shape(NodeMixin):
         shape_list.Append(self.wrapped)
 
         # Define the splitting tool
-        tool = (
-            Face.make_plane(surface).wrapped
-            if isinstance(surface, Plane)
-            else surface.wrapped
+        trim_tool = (
+            Face.make_plane(tool).wrapped if isinstance(tool, Plane) else tool.wrapped
         )
         tool_list = TopTools_ListOfShape()
-        tool_list.Append(tool)
+        tool_list.Append(trim_tool)
 
         # Create the splitter algorithm
         splitter = BRepAlgoAPI_Splitter()
@@ -2764,21 +2852,27 @@ class Shape(NodeMixin):
         # Perform the splitting operation
         splitter.Build()
 
-        result = Compound(downcast(splitter.Shape())).unwrap(fully=False)
+        result = downcast(splitter.Shape())
+        # Remove unnecessary TopoDS_Compound around single shape
+        if isinstance(result, TopoDS_Compound):
+            result = unwrap_topods_compound(result, False)
+        result = Shape.cast(result)
+
         if keep != Keep.BOTH:
-            if not isinstance(surface, Plane):
+            if not isinstance(tool, Plane):
                 # Create solids from the surfaces for sorting
-                surface_up = surface.thicken(0.1)
+                surface_up = tool.thicken(0.1)
             tops, bottoms = [], []
             for part in result:
-                if isinstance(surface, Plane):
-                    is_up = surface.to_local_coords(part).center().Z >= 0
+                if isinstance(tool, Plane):
+                    is_up = tool.to_local_coords(part).center().Z >= 0
                 else:
                     is_up = surface_up.intersect(part).volume >= TOLERANCE
                 (tops if is_up else bottoms).append(part)
             result = Compound(tops) if keep == Keep.TOP else Compound(bottoms)
 
-        return result.unwrap(fully=True)
+        result_wrapped = unwrap_topods_compound(result.wrapped, fully=True)
+        return Shape.cast(result_wrapped)
 
     @overload
     def split_by_perimeter(
@@ -2862,10 +2956,10 @@ class Shape(NodeMixin):
         # Is left or right the inside?
         perimeter_length = perimeter.length
         left_perimeter_length = (
-            sum(e.length for e in left.edges()) if not left is None else 0
+            sum(e.length for e in left.edges()) if left is not None else 0
         )
         right_perimeter_length = (
-            sum(e.length for e in right.edges()) if not right is None else 0
+            sum(e.length for e in right.edges()) if right is not None else 0
         )
         left_inside = abs(perimeter_length - left_perimeter_length) < abs(
             perimeter_length - right_perimeter_length
@@ -3447,7 +3541,7 @@ class ShapeList(list[T]):
         # could be moved out maybe?
         def axis_parallel_predicate(axis: Axis, tolerance: float):
             def pred(shape: Shape):
-                if isinstance(shape, Face) and shape.geom_type == GeomType.PLANE:
+                if isinstance(shape, Face) and shape.is_planar:
                     shape_axis = Axis(shape.center(), shape.normal_at(None))
                 elif isinstance(shape, Edge) and shape.geom_type == GeomType.LINE:
                     shape_axis = Axis(shape.position_at(0), shape.tangent_at(0))
@@ -3462,7 +3556,7 @@ class ShapeList(list[T]):
             plane_xyz = plane.z_dir.wrapped.XYZ()
 
             def pred(shape: Shape):
-                if isinstance(shape, Face) and shape.geom_type == GeomType.PLANE:
+                if isinstance(shape, Face) and shape.is_planar:
                     shape_axis = Axis(shape.center(), shape.normal_at(None))
                     return plane_axis.is_parallel(shape_axis, tolerance)
                 if isinstance(shape, Wire):
@@ -3728,7 +3822,10 @@ class ShapeList(list[T]):
         vertices = self.vertices()
         vertex_count = len(vertices)
         if vertex_count != 1:
-            warnings.warn(f"Found {vertex_count} vertices, returning first")
+            warnings.warn(
+                f"Found {vertex_count} vertices, returning first",
+                stacklevel=2,
+            )
         return vertices[0]
 
     def edges(self) -> ShapeList[Edge]:
@@ -3740,7 +3837,10 @@ class ShapeList(list[T]):
         edges = self.edges()
         edge_count = len(edges)
         if edge_count != 1:
-            warnings.warn(f"Found {edge_count} edges, returning first")
+            warnings.warn(
+                f"Found {edge_count} edges, returning first",
+                stacklevel=2,
+            )
         return edges[0]
 
     def wires(self) -> ShapeList[Wire]:
@@ -3752,7 +3852,10 @@ class ShapeList(list[T]):
         wires = self.wires()
         wire_count = len(wires)
         if wire_count != 1:
-            warnings.warn(f"Found {wire_count} wires, returning first")
+            warnings.warn(
+                f"Found {wire_count} wires, returning first",
+                stacklevel=2,
+            )
         return wires[0]
 
     def faces(self) -> ShapeList[Face]:
@@ -3765,7 +3868,7 @@ class ShapeList(list[T]):
         face_count = len(faces)
         if face_count != 1:
             msg = f"Found {face_count} faces, returning first"
-            warnings.warn(msg)
+            warnings.warn(msg, stacklevel=2)
         return faces[0]
 
     def shells(self) -> ShapeList[Shell]:
@@ -3777,7 +3880,10 @@ class ShapeList(list[T]):
         shells = self.shells()
         shell_count = len(shells)
         if shell_count != 1:
-            warnings.warn(f"Found {shell_count} shells, returning first")
+            warnings.warn(
+                f"Found {shell_count} shells, returning first",
+                stacklevel=2,
+            )
         return shells[0]
 
     def solids(self) -> ShapeList[Solid]:
@@ -3789,7 +3895,10 @@ class ShapeList(list[T]):
         solids = self.solids()
         solid_count = len(solids)
         if solid_count != 1:
-            warnings.warn(f"Found {solid_count} solids, returning first")
+            warnings.warn(
+                f"Found {solid_count} solids, returning first",
+                stacklevel=2,
+            )
         return solids[0]
 
     def compounds(self) -> ShapeList[Compound]:
@@ -3801,7 +3910,10 @@ class ShapeList(list[T]):
         compounds = self.compounds()
         compound_count = len(compounds)
         if compound_count != 1:
-            warnings.warn(f"Found {compound_count} compounds, returning first")
+            warnings.warn(
+                f"Found {compound_count} compounds, returning first",
+                stacklevel=2,
+            )
         return compounds[0]
 
     def __gt__(self, sort_by: Union[Axis, SortBy] = Axis.Z):
@@ -3938,6 +4050,12 @@ class Compound(Mixin3D, Shape):
     of shapes as unified entities for efficient modeling and analysis."""
 
     _dim = None
+
+    @property
+    def _dim(self) -> Union[int, None]:
+        """The dimension of the shapes within the Compound - None if inconsistent"""
+        sub_dims = {s._dim for s in self.get_top_level_shapes()}
+        return sub_dims.pop() if len(sub_dims) == 1 else None
 
     @overload
     def __init__(
@@ -4172,6 +4290,47 @@ class Compound(Mixin3D, Shape):
             self.wrapped = Compound._make_compound([c.wrapped for c in self.children])
         # else:
         #     logger.debug("Adding no children to %s", self.label)
+
+    def __add__(self, other: Union[list[Shape], Shape]) -> Shape:
+        """Combine other to self `+` operator
+
+        Note that if all of the objects are connected Edges/Wires the result
+        will be a Wire, otherwise a Shape.
+        """
+        if self._dim == 1:
+            curve = Curve() if self.wrapped is None else Curve(self.wrapped)
+            self.copy_attributes_to(curve, ["wrapped", "_NodeMixin__children"])
+            return curve + other
+        else:
+            summands = [
+                shape
+                for o in (other if isinstance(other, (list, tuple)) else [other])
+                if o is not None
+                for shape in o.get_top_level_shapes()
+            ]
+            # If there is nothing to add return the original object
+            if not summands:
+                return self
+
+            summands = [
+                s for s in self.get_top_level_shapes() + summands if s is not None
+            ]
+
+            # Only fuse the parts if necessary
+            if len(summands) <= 1:
+                result: Shape = summands[0]
+            else:
+                fuse_op = BRepAlgoAPI_Fuse()
+                fuse_op.SetFuzzyValue(TOLERANCE)
+                self.copy_attributes_to(
+                    summands[0], ["wrapped", "_NodeMixin__children"]
+                )
+                result = self._bool_op(summands[:1], summands[1:], fuse_op)
+
+            if SkipClean.clean:
+                result = result.clean()
+
+            return result
 
     def do_children_intersect(
         self, include_parent: bool = False, tolerance: float = 1e-5
@@ -4411,64 +4570,6 @@ class Compound(Mixin3D, Shape):
 
         return TopoDS_Iterator(self.wrapped).More()
 
-    def cut(self, *to_cut: Shape) -> Compound:
-        """Remove a shape from another one
-
-        Args:
-          *to_cut: Shape:
-
-        Returns:
-
-        """
-
-        cut_op = BRepAlgoAPI_Cut()
-
-        return tcast(Compound, self._bool_op(self, to_cut, cut_op))
-
-    def fuse(self, *to_fuse: Shape, glue: bool = False, tol: float = None) -> Compound:
-        """Fuse shapes together
-
-        Args:
-          *to_fuse: Shape:
-          glue: bool:  (Default value = False)
-          tol: float:  (Default value = None)
-
-        Returns:
-
-        """
-
-        fuse_op = BRepAlgoAPI_Fuse()
-        if glue:
-            fuse_op.SetGlue(BOPAlgo_GlueEnum.BOPAlgo_GlueShift)
-        if tol:
-            fuse_op.SetFuzzyValue(tol)
-
-        args = tuple(self) + to_fuse
-
-        if len(args) <= 1:
-            return_value: Shape = args[0]
-        else:
-            return_value = self._bool_op(args[:1], args[1:], fuse_op)
-
-        # fuse_op.RefineEdges()
-        # fuse_op.FuseEdges()
-
-        return tcast(Compound, return_value)
-
-    def intersect(self, *to_intersect: Shape) -> Compound:
-        """Construct shape intersection
-
-        Args:
-          *to_intersect: Shape:
-
-        Returns:
-
-        """
-
-        intersect_op = BRepAlgoAPI_Common()
-
-        return tcast(Compound, self._bool_op(self, to_intersect, intersect_op))
-
     def get_type(
         self,
         obj_type: Union[
@@ -4520,6 +4621,7 @@ class Compound(Mixin3D, Shape):
         """
         if len(self) == 1:
             single_element = next(iter(self))
+            self.copy_attributes_to(single_element, ["wrapped", "_NodeMixin__children"])
 
             # If the single element is another Compound, unwrap it recursively
             if isinstance(single_element, Compound):
@@ -4527,12 +4629,7 @@ class Compound(Mixin3D, Shape):
                 unwrapped = single_element.unwrap(fully)
                 if not fully:
                     unwrapped = type(self)(unwrapped.wrapped)
-                attr_to_copy = [
-                    attr
-                    for attr in self.__dict__.keys()
-                    if attr not in ["wrapped", "_NodeMixin__children"]
-                ]
-                self.copy_attributes_to(unwrapped, attr_to_copy)
+                self.copy_attributes_to(unwrapped, ["wrapped", "_NodeMixin__children"])
                 return unwrapped
 
             return single_element if fully else self
@@ -4546,17 +4643,31 @@ class Part(Compound):
 
     _dim = 3
 
+    @property
+    def _dim(self) -> int:
+        return 3
+
 
 class Sketch(Compound):
     """A Compound containing 2D objects - aka Faces"""
 
     _dim = 2
 
+    @property
+    def _dim(self) -> int:
+        return 2
+
 
 class Curve(Compound):
     """A Compound containing 1D objects - aka Edges"""
 
     _dim = 1
+
+    @property
+    def _dim(self) -> int:
+        return 1
+
+    __add__ = Mixin1D.__add__
 
     def __matmul__(self, position: float) -> Vector:
         """Position on curve operator @ - only works if continuous"""
@@ -4587,6 +4698,10 @@ class Edge(Mixin1D, Shape):
     # pylint: disable=too-many-public-methods
 
     _dim = 1
+
+    @property
+    def _dim(self) -> int:
+        return 1
 
     @overload
     def __init__(
@@ -5515,6 +5630,10 @@ class Face(Shape):
 
     _dim = 2
 
+    @property
+    def _dim(self) -> int:
+        return 2
+
     @overload
     def __init__(
         self,
@@ -5601,7 +5720,7 @@ class Face(Shape):
     def length(self) -> float:
         """length of planar face"""
         result = None
-        if self.geom_type == GeomType.PLANE:
+        if self.is_planar:
             # Reposition on Plane.XY
             flat_face = Plane(self).to_local_coords(self)
             face_vertices = flat_face.vertices().sort_by(Axis.X)
@@ -5617,7 +5736,7 @@ class Face(Shape):
     def width(self) -> float:
         """width of planar face"""
         result = None
-        if self.geom_type == GeomType.PLANE:
+        if self.is_planar:
             # Reposition on Plane.XY
             flat_face = Plane(self).to_local_coords(self)
             face_vertices = flat_face.vertices().sort_by(Axis.Y)
@@ -5628,7 +5747,7 @@ class Face(Shape):
     def geometry(self) -> str:
         """geometry of planar face"""
         result = None
-        if self.geom_type == GeomType.PLANE:
+        if self.is_planar:
             flat_face = Plane(self).to_local_coords(self)
             flat_face_edges = flat_face.edges()
             if all([e.geom_type == GeomType.LINE for e in flat_face_edges]):
@@ -5660,6 +5779,13 @@ class Face(Shape):
         """Location at the center of face"""
         origin = self.position_at(0.5, 0.5)
         return Plane(origin, z_dir=self.normal_at(origin)).location
+
+    @property
+    def is_planar(face: Face) -> bool:
+        """Is the face planar even though its geom_type may not be PLANE"""
+        surface = BRep_Tool.Surface_s(face.wrapped)
+        is_face_planar = GeomLib_IsPlanarSurface(surface, TOLERANCE)
+        return is_face_planar.IsPlanar()
 
     def _geom_adaptor(self) -> Geom_Surface:
         """ """
@@ -5810,7 +5936,7 @@ class Face(Shape):
             Vector: center
         """
         if (center_of == CenterOf.MASS) or (
-            center_of == CenterOf.GEOMETRY and self.geom_type == GeomType.PLANE
+            center_of == CenterOf.GEOMETRY and self.is_planar
         ):
             properties = GProp_GProps()
             BRepGProp.SurfaceProperties_s(self.wrapped, properties)
@@ -5843,7 +5969,10 @@ class Face(Shape):
     def wire(self) -> Wire:
         """Return the outerwire, generate a warning if inner_wires present"""
         if self.inner_wires():
-            warnings.warn("Found holes, returning outer_wire")
+            warnings.warn(
+                "Found holes, returning outer_wire",
+                stacklevel=2,
+            )
         return self.outer_wire()
 
     @classmethod
@@ -6093,9 +6222,12 @@ class Face(Shape):
         """make_surface_from_array_of_points
 
         Approximate a spline surface through the provided 2d array of points.
+        The first dimension correspond to points on the vertical direction in the parameter space of the face.
+        The second dimension correspond to points on the horizontal direction in the parameter space of the face.
+        The 2 dimensions are U,V dimensions of the parameter space of the face.
 
         Args:
-            points (list[list[VectorLike]]): a 2D list of points
+            points (list[list[VectorLike]]): a 2D list of points, first dimension is V parameters second is U parameters.
             tol (float, optional): tolerance of the algorithm. Defaults to 1e-2.
             smoothing (Tuple[float, float, float], optional): optional tuple of
                 3 weights use for variational smoothing. Defaults to None.
@@ -6383,7 +6515,9 @@ class Face(Shape):
             and 1 - abs(plane.z_dir.dot(Vector(normal))) < TOLERANCE
         )
 
-    def thicken(self, depth: float, normal_override: VectorLike = None) -> Solid:
+    def thicken(
+        self, depth: float, normal_override: Optional[VectorLike] = None
+    ) -> Solid:
         """Thicken Face
 
         Create a solid from a potentially non planar face by thickening along the normals.
@@ -6413,27 +6547,7 @@ class Face(Shape):
             if face_normal.dot(Vector(normal_override).normalized()) < 0:
                 adjusted_depth = -depth
 
-        solid = BRepOffset_MakeOffset()
-        solid.Initialize(
-            self.wrapped,
-            Offset=adjusted_depth,
-            Tol=1.0e-5,
-            Mode=BRepOffset_Skin,
-            # BRepOffset_RectoVerso - which describes the offset of a given surface shell along both
-            # sides of the surface but doesn't seem to work
-            Intersection=True,
-            SelfInter=False,
-            Join=GeomAbs_Intersection,  # Could be GeomAbs_Arc,GeomAbs_Tangent,GeomAbs_Intersection
-            Thickening=True,
-            RemoveIntEdges=True,
-        )
-        solid.MakeOffsetShape()
-        try:
-            result = Solid(solid.Shape())
-        except StdFail_NotDone as err:
-            raise RuntimeError("Error applying thicken to given Face") from err
-
-        return result.clean()
+        return _thicken(self.wrapped, adjusted_depth)
 
     def project_to_shape(
         self, target_object: Shape, direction: VectorLike, taper: float = 0
@@ -6629,7 +6743,6 @@ class Face(Shape):
             projection = projection_faces.pop(0).fuse(*projection_faces).clean()
 
         return projection
-        return target_projected_edges
 
     def make_holes(self, interior_wires: list[Wire]) -> Face:
         """Make Holes in Face
@@ -6703,6 +6816,10 @@ class Shell(Shape):
     operations and analyses."""
 
     _dim = 2
+
+    @property
+    def _dim(self) -> int:
+        return 2
 
     @overload
     def __init__(
@@ -6872,6 +6989,45 @@ class Shell(Shape):
         builder.Build()
         return Shape.cast(builder.Shape())
 
+    @classmethod
+    def make_loft(
+        cls, objs: Iterable[Union[Vertex, Wire]], ruled: bool = False
+    ) -> Shell:
+        """make loft
+
+        Makes a loft from a list of wires and vertices.
+        Vertices can appear only at the beginning or end of the list, but cannot appear consecutively within the list
+        nor between wires.
+        Wires may be closed or opened.
+
+        Args:
+            objs (list[Vertex, Wire]): wire perimeters or vertices
+            ruled (bool, optional): stepped or smooth. Defaults to False (smooth).
+
+        Raises:
+            ValueError: Too few wires
+
+        Returns:
+            Shell: Lofted object
+        """
+        return cls(_make_loft(objs, False, ruled))
+
+    def thicken(self, depth: float) -> Solid:
+        """Thicken Shell
+
+        Create a solid from a shell by thickening along the normals.
+
+        Args:
+            depth (float): Amount to thicken face(s), can be positive or negative.
+
+        Raises:
+            RuntimeError: Opencascade internal failures
+
+        Returns:
+            Solid: The resulting Solid object
+        """
+        return _thicken(self.wrapped, depth)
+
 
 class Solid(Mixin3D, Shape):
     """A Solid in build123d represents a three-dimensional solid geometry
@@ -6882,6 +7038,10 @@ class Solid(Mixin3D, Shape):
     Solid objects to create or modify complex geometries."""
 
     _dim = 3
+
+    @property
+    def _dim(self) -> int:
+        return 3
 
     @overload
     def __init__(
@@ -7131,8 +7291,9 @@ class Solid(Mixin3D, Shape):
     ) -> Solid:
         """make loft
 
-        Makes a loft from a list of wires and vertices, where vertices can be the first,
-        last, or first and last elements.
+        Makes a loft from a list of wires and vertices.
+        Vertices can appear only at the beginning or end of the list, but cannot appear consecutively within the list
+        nor between wires.
 
         Args:
             objs (list[Vertex, Wire]): wire perimeters or vertices
@@ -7144,22 +7305,7 @@ class Solid(Mixin3D, Shape):
         Returns:
             Solid: Lofted object
         """
-
-        if len(objs) < 2:
-            raise ValueError("More than one wire, or a wire and a vertex is required")
-
-        # the True flag requests building a solid instead of a shell.
-        loft_builder = BRepOffsetAPI_ThruSections(True, ruled)
-
-        for obj in objs:
-            if isinstance(obj, Vertex):
-                loft_builder.AddVertex(obj.wrapped)
-            elif isinstance(obj, Wire):
-                loft_builder.AddWire(obj.wrapped)
-
-        loft_builder.Build()
-
-        return cls(loft_builder.Shape())
+        return cls(_make_loft(objs, True, ruled))
 
     @classmethod
     def make_wedge(
@@ -7444,9 +7590,7 @@ class Solid(Mixin3D, Shape):
         clip_faces = [
             f
             for f in faces
-            if not (
-                f.geom_type == GeomType.PLANE and f.normal_at().dot(direction) == 0.0
-            )
+            if not (f.is_planar and f.normal_at().dot(direction) == 0.0)
         ]
         if not clip_faces:
             raise ValueError("provided face does not intersect target_object")
@@ -7469,8 +7613,11 @@ class Solid(Mixin3D, Shape):
                         .solids()
                         .sort_by(direction_axis)[0]
                     )
-                except:  # pylint: disable=bare-except
-                    warnings.warn("clipping error - extrusion may be incorrect")
+                except Exception:
+                    warnings.warn(
+                        "clipping error - extrusion may be incorrect",
+                        stacklevel=2,
+                    )
         else:
             extrusion_parts = [extrusion.intersect(target_object)]
             for clipping_object in clipping_objects:
@@ -7480,8 +7627,11 @@ class Solid(Mixin3D, Shape):
                         .solids()
                         .sort_by(direction_axis)[0]
                     )
-                except:  # pylint: disable=bare-except
-                    warnings.warn("clipping error - extrusion may be incorrect")
+                except Exception:
+                    warnings.warn(
+                        "clipping error - extrusion may be incorrect",
+                        stacklevel=2,
+                    )
             extrusion = Shape.fuse(*extrusion_parts)
 
         return extrusion
@@ -7676,6 +7826,10 @@ class Vertex(Shape):
 
     _dim = 0
 
+    @property
+    def _dim(self) -> int:
+        return 0
+
     @overload
     def __init__(self):  # pragma: no cover
         """Default Vertext at the origin"""
@@ -7856,6 +8010,10 @@ class Wire(Mixin1D, Shape):
     allowing precise definition of paths within a 3D model."""
 
     _dim = 1
+
+    @property
+    def _dim(self) -> int:
+        return 1
 
     @overload
     def __init__(
@@ -8292,7 +8450,10 @@ class Wire(Mixin1D, Shape):
         wire_builder.Build()
         if not wire_builder.IsDone():
             if wire_builder.Error() == BRepBuilderAPI_NonManifoldWire:
-                warnings.warn("Wire is non manifold")
+                warnings.warn(
+                    "Wire is non manifold (e.g. branching, self intersecting)",
+                    stacklevel=2,
+                )
             elif wire_builder.Error() == BRepBuilderAPI_EmptyWire:
                 raise RuntimeError("Wire is empty")
             elif wire_builder.Error() == BRepBuilderAPI_DisconnectedWire:
@@ -8525,11 +8686,11 @@ class Wire(Mixin1D, Shape):
             edge1 = points_lookup[simplice[1]][0]
             # Look for connecting edges between edges
             if edge0 != edge1:
-                if not edge0 in trim_points:
+                if edge0 not in trim_points:
                     trim_points[edge0] = [simplice[0]]
                 else:
                     trim_points[edge0].append(simplice[0])
-                if not edge1 in trim_points:
+                if edge1 not in trim_points:
                     trim_points[edge1] = [simplice[1]]
                 else:
                     trim_points[edge1].append(simplice[1])
@@ -8543,7 +8704,7 @@ class Wire(Mixin1D, Shape):
             elif abs(simplice[0] - simplice[1]) != 1:
                 start_pnt = min(simplice.tolist())
                 end_pnt = max(simplice.tolist())
-                if not edge0 in trim_points:
+                if edge0 not in trim_points:
                     trim_points[edge0] = [start_pnt, end_pnt]
                 else:
                     trim_points[edge0].extend([start_pnt, end_pnt])
@@ -8621,7 +8782,7 @@ class Wire(Mixin1D, Shape):
             center_point = Vector(center)
 
         # Project the wire on the target object
-        if not direction_vector is None:
+        if direction_vector is not None:
             projection_object = BRepProj_Projection(
                 self.wrapped,
                 Shape.cast(target_object.wrapped).wrapped,
@@ -8735,6 +8896,89 @@ class Joint(ABC):
     def symbol(self) -> Compound:  # pragma: no cover
         """A CAD object positioned in global space to illustrate the joint"""
         raise NotImplementedError
+
+
+def _thicken(obj: TopoDS_Shape, depth: float):
+    solid = BRepOffset_MakeOffset()
+    solid.Initialize(
+        obj,
+        Offset=depth,
+        Tol=1.0e-5,
+        Mode=BRepOffset_Skin,
+        # BRepOffset_RectoVerso - which describes the offset of a given surface shell along both
+        # sides of the surface but doesn't seem to work
+        Intersection=True,
+        SelfInter=False,
+        Join=GeomAbs_Intersection,  # Could be GeomAbs_Arc,GeomAbs_Tangent,GeomAbs_Intersection
+        Thickening=True,
+        RemoveIntEdges=True,
+    )
+    solid.MakeOffsetShape()
+    try:
+        result = Solid(solid.Shape())
+    except StdFail_NotDone as err:
+        raise RuntimeError("Error applying thicken to given Face") from err
+
+    return result.clean()
+
+
+def _make_loft(
+    objs: Iterable[Union[Vertex, Wire]],
+    filled: bool,
+    ruled: bool = False,
+) -> TopoDS_Shape:
+    """make loft
+
+    Makes a loft from a list of wires and vertices.
+    Vertices can appear only at the beginning or end of the list, but cannot appear consecutively within the list
+    nor between wires.
+
+    Args:
+        wires (list[Wire]): section perimeters
+        ruled (bool, optional): stepped or smooth. Defaults to False (smooth).
+
+    Raises:
+        ValueError: Too few wires
+
+    Returns:
+        TopoDS_Shape: Lofted object
+    """
+    if len(objs) < 2:
+        raise ValueError("More than one wire is required")
+    vertices = [obj for obj in objs if isinstance(obj, Vertex)]
+    vertex_count = len(vertices)
+
+    if vertex_count > 2:
+        raise ValueError("Only two vertices are allowed")
+
+    if vertex_count == 1 and not (
+        isinstance(objs[0], Vertex) or isinstance(objs[-1], Vertex)
+    ):
+        raise ValueError(
+            "The vertex must be either at the beginning or end of the list"
+        )
+
+    if vertex_count == 2:
+        if len(objs) == 2:
+            raise ValueError(
+                "You can't have only 2 vertices to loft; try adding some wires"
+            )
+        if not (isinstance(objs[0], Vertex) and isinstance(objs[-1], Vertex)):
+            raise ValueError(
+                "The vertices must be at the beginning and end of the list"
+            )
+
+    loft_builder = BRepOffsetAPI_ThruSections(filled, ruled)
+
+    for obj in objs:
+        if isinstance(obj, Vertex):
+            loft_builder.AddVertex(obj.wrapped)
+        elif isinstance(obj, Wire):
+            loft_builder.AddWire(obj.wrapped)
+
+    loft_builder.Build()
+
+    return loft_builder.Shape()
 
 
 def downcast(obj: TopoDS_Shape) -> TopoDS_Shape:
@@ -8975,6 +9219,33 @@ def topo_explore_common_vertex(
         vert_exp.Next()
 
     return None  # No common vertex found
+
+
+def unwrap_topods_compound(
+    compound: TopoDS_Compound, fully: bool = True
+) -> Union[TopoDS_Compound, TopoDS_Shape]:
+    """Strip unnecessary Compound wrappers
+
+    Args:
+        compound (TopoDS_Compound): The TopoDS_Compound to unwrap.
+        fully (bool, optional): return base shape without any TopoDS_Compound
+            wrappers (otherwise one TopoDS_Compound is left). Defaults to True.
+
+    Returns:
+        Union[TopoDS_Compound, TopoDS_Shape]: base shape
+    """
+    if compound.NbChildren() == 1:
+        iterator = TopoDS_Iterator(compound)
+        single_element = downcast(iterator.Value())
+
+        # If the single element is another TopoDS_Compound, unwrap it recursively
+        if isinstance(single_element, TopoDS_Compound):
+            return unwrap_topods_compound(single_element, fully)
+
+        return single_element if fully else compound
+
+    # If there are no elements or more than one element, return TopoDS_Compound
+    return compound
 
 
 class SkipClean:

@@ -36,8 +36,25 @@ from typing import Iterable, Union
 from build123d.build_common import LocationList, flatten_sequence, validate_inputs
 from build123d.build_enums import Align, FontStyle, Mode
 from build123d.build_sketch import BuildSketch
-from build123d.geometry import Axis, Location, Rotation, Vector, VectorLike
-from build123d.topology import Compound, Edge, Face, ShapeList, Sketch, Wire, tuplify
+from build123d.geometry import (
+    Axis,
+    Location,
+    Rotation,
+    Vector,
+    VectorLike,
+    to_align_offset,
+)
+from build123d.topology import (
+    Compound,
+    Edge,
+    Face,
+    ShapeList,
+    Sketch,
+    Wire,
+    tuplify,
+    TOLERANCE,
+    topo_explore_common_vertex,
+)
 
 
 class BaseSketchObject(Sketch):
@@ -64,7 +81,7 @@ class BaseSketchObject(Sketch):
     ):
         if align is not None:
             align = tuplify(align, 2)
-            obj.move(Location(Vector(*obj.bounding_box().to_align_offset(align))))
+            obj.move(Location(obj.bounding_box().to_align_offset(align)))
 
         context: BuildSketch = BuildSketch._get_context(self, log=False)
         if context is None:
@@ -334,19 +351,8 @@ class RegularPolygon(BaseSketchObject):
         mins = [pts_sorted[0][0].X, pts_sorted[1][0].Y]
         maxs = [pts_sorted[0][-1].X, pts_sorted[1][-1].Y]
 
-        if align is not None:
-            align = tuplify(align, 2)
-            align_offset = []
-            for i in range(2):
-                if align[i] == Align.MIN:
-                    align_offset.append(-mins[i])
-                elif align[i] == Align.CENTER:
-                    align_offset.append(0)
-                elif align[i] == Align.MAX:
-                    align_offset.append(-maxs[i])
-        else:
-            align_offset = [0, 0]
-        pts = [point + Vector(*align_offset) for point in pts]
+        align_offset = to_align_offset(mins, maxs, align, center=(0, 0))
+        pts = [point + align_offset for point in pts]
 
         face = Face(Wire.make_polygon(pts))
         super().__init__(face, rotation=0, align=None, mode=mode)
@@ -419,6 +425,13 @@ class SlotCenterPoint(BaseSketchObject):
         self.slot_height = height
 
         half_line = point_v - center_v
+
+        if half_line.length * 2 <= height:
+            raise ValueError(
+                f"Slots must have width > height. "
+                "Got: {height=} width={half_line.length * 2} (computed)"
+            )
+
         face = Face(
             Wire.combine(
                 [
@@ -452,6 +465,11 @@ class SlotCenterToCenter(BaseSketchObject):
         rotation: float = 0,
         mode: Mode = Mode.ADD,
     ):
+        if center_separation <= 0:
+            raise ValueError(
+                f"Requires center_separation > 0. Got: {center_separation=}"
+            )
+
         context = BuildSketch._get_context(self)
         validate_inputs(context, self)
 
@@ -493,6 +511,11 @@ class SlotOverall(BaseSketchObject):
         align: Union[Align, tuple[Align, Align]] = (Align.CENTER, Align.CENTER),
         mode: Mode = Mode.ADD,
     ):
+        if width <= height:
+            raise ValueError(
+                f"Slot requires that width > height. Got: {width=}, {height=}"
+            )
+
         context = BuildSketch._get_context(self)
         validate_inputs(context, self)
 
@@ -720,3 +743,25 @@ class Triangle(BaseSketchObject):
         triangle.move(Location(-center_of_geometry))
         alignment = None if align is None else tuplify(align, 2)
         super().__init__(obj=triangle, rotation=rotation, align=alignment, mode=mode)
+        self.edge_a = self.edges().filter_by(lambda e: abs(e.length - a) < TOLERANCE)[
+            0
+        ]  #: edge 'a'
+        self.edge_b = self.edges().filter_by(
+            lambda e: abs(e.length - b) < TOLERANCE and e not in [self.edge_a]
+        )[
+            0
+        ]  #: edge 'b'
+        self.edge_c = self.edges().filter_by(
+            lambda e: e not in [self.edge_a, self.edge_b]
+        )[
+            0
+        ]  #: edge 'c'
+        self.vertex_A = topo_explore_common_vertex(
+            self.edge_b, self.edge_c
+        )  #: vertex 'A'
+        self.vertex_B = topo_explore_common_vertex(
+            self.edge_a, self.edge_c
+        )  #: vertex 'B'
+        self.vertex_C = topo_explore_common_vertex(
+            self.edge_a, self.edge_b
+        )  #: vertex 'C'

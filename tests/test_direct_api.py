@@ -14,6 +14,7 @@ from random import uniform
 from IPython.lib import pretty
 
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+from OCP.BRepGProp import BRepGProp
 from OCP.gp import (
     gp,
     gp_Ax1,
@@ -28,6 +29,7 @@ from OCP.gp import (
     gp_Vec,
     gp_XYZ,
 )
+from OCP.GProp import GProp_GProps
 
 from build123d.build_common import GridLocations, Locations, PolarLocations
 from build123d.build_enums import (
@@ -88,6 +90,7 @@ from build123d.topology import (
     polar,
     new_edges,
     delta,
+    unwrap_topods_compound,
 )
 from build123d.jupyter_tools import display
 
@@ -875,6 +878,16 @@ class TestCompound(DirectApiTestCase):
         comp4 = comp3.unwrap(fully=True)
         self.assertTrue(isinstance(comp4, Face))
 
+    def test_get_top_level_shapes(self):
+        base_shapes = Compound(children=PolarLocations(15, 20) * Box(4, 4, 4))
+        fls = base_shapes.get_top_level_shapes()
+        self.assertTrue(isinstance(fls, ShapeList))
+        self.assertEqual(len(fls), 20)
+        self.assertTrue(all(isinstance(s, Solid) for s in fls))
+
+        b1 = Box(1, 1, 1).solid()
+        self.assertEqual(b1.get_top_level_shapes()[0], b1)
+
 
 class TestEdge(DirectApiTestCase):
     def test_close(self):
@@ -1220,6 +1233,21 @@ class TestFace(DirectApiTestCase):
             extrude(amount=1)
         self.assertEqual(test.faces().sort_by(Axis.Z).last.geometry, "POLYGON")
 
+    def test_is_planar(self):
+        self.assertTrue(Face.make_rect(1, 1).is_planar)
+        self.assertFalse(
+            Solid.make_cylinder(1, 1).faces().filter_by(GeomType.CYLINDER)[0].is_planar
+        )
+        # Some of these faces have geom_type BSPLINE but are planar
+        mount = Solid.make_loft(
+            [
+                Rectangle((1 + 16 + 4), 20, align=(Align.MIN, Align.CENTER)).wire(),
+                Pos(1, 0, 4)
+                * Rectangle(16, 20, align=(Align.MIN, Align.CENTER)).wire(),
+            ],
+        )
+        self.assertTrue(all(f.is_planar for f in mount.faces()))
+
     def test_negate(self):
         square = Face.make_rect(1, 1)
         self.assertVectorAlmostEquals(square.normal_at(), (0, 0, 1), 5)
@@ -1552,6 +1580,28 @@ class TestFunctions(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             Vector(1, 1, 1) & ("x", "y", "z")
+
+    def test_unwrap_topods_compound(self):
+        # Complex Compound
+        b1 = Box(1, 1, 1).solid()
+        b2 = Box(2, 2, 2).solid()
+        c1 = Compound([b1, b2])
+        c2 = Compound([b1, c1])
+        c3 = Compound([c2])
+        c4 = Compound([c3])
+        self.assertEqual(c4.wrapped.NbChildren(), 1)
+        c5 = Compound(unwrap_topods_compound(c4.wrapped, False))
+        self.assertEqual(c5.wrapped.NbChildren(), 2)
+
+        # unwrap fully
+        c0 = Compound([b1])
+        c1 = Compound([c0])
+        result = Shape.cast(unwrap_topods_compound(c1.wrapped, True))
+        self.assertTrue(isinstance(result, Solid))
+
+        # unwrap not fully
+        result = Shape.cast(unwrap_topods_compound(c1.wrapped, False))
+        self.assertTrue(isinstance(result, Compound))
 
 
 class TestImportExport(DirectApiTestCase):
@@ -2541,6 +2591,39 @@ class TestPlane(DirectApiTestCase):
         with self.assertRaises(TypeError):
             Plane(Edge.make_line((0, 0), (0, 1)))
 
+        # can be instantiated from planar faces of surface types other than Geom_Plane
+        # this loft creates the trapezoid faces of type Geom_BSplineSurface
+        lofted_solid = Solid.make_loft(
+            [
+                Rectangle(3, 1).wire(),
+                Pos(0, 0, 1) * Rectangle(1, 1).wire(),
+            ]
+        )
+
+        expected = [
+            # Trapezoid face, negative y coordinate
+            (
+                Axis.X.direction,  # plane x_dir
+                Axis.Z.direction,  # plane y_dir
+                -Axis.Y.direction,  # plane z_dir
+            ),
+            # Trapezoid face, positive y coordinate
+            (
+                -Axis.X.direction,
+                Axis.Z.direction,
+                Axis.Y.direction,
+            ),
+        ]
+        # assert properties of the trapezoid faces
+        for i, f in enumerate(lofted_solid.faces() | Plane.XZ > Axis.Y):
+            p = Plane(f)
+            f_props = GProp_GProps()
+            BRepGProp.SurfaceProperties_s(f.wrapped, f_props)
+            self.assertVectorAlmostEquals(p.origin, f_props.CentreOfMass(), 6)
+            self.assertVectorAlmostEquals(p.x_dir, expected[i][0], 6)
+            self.assertVectorAlmostEquals(p.y_dir, expected[i][1], 6)
+            self.assertVectorAlmostEquals(p.z_dir, expected[i][2], 6)
+
     def test_plane_neg(self):
         p = Plane(
             origin=(1, 2, 3),
@@ -2982,6 +3065,24 @@ class TestShape(DirectApiTestCase):
         self.assertLess(s2.volume, s.volume)
         self.assertGreater(s2.volume, 0.0)
 
+    def test_split_by_non_planar_face(self):
+        box = Solid.make_box(1, 1, 1)
+        tool = Circle(1).wire()
+        tool_shell: Shell = Shape.extrude(tool, Vector(0, 0, 1))
+        split = box.split(tool_shell, keep=Keep.BOTH)
+
+        self.assertEqual(len(split.solids()), 2)
+        self.assertGreater(split.solids()[0].volume, split.solids()[1].volume)
+
+    def test_split_by_shell(self):
+        box = Solid.make_box(5, 5, 1)
+        tool = Wire.make_rect(4, 4)
+        tool_shell: Shell = Shape.extrude(tool, Vector(0, 0, 1))
+        split = box.split(tool_shell, keep=Keep.TOP)
+        inner_vol = 2 * 2
+        outer_vol = 5 * 5
+        self.assertAlmostEqual(split.volume, outer_vol - inner_vol)
+
     def test_split_by_perimeter(self):
         # Test 0 - extract a spherical cap
         target0 = Solid.make_sphere(10).rotate(Axis.Z, 90)
@@ -3306,25 +3407,15 @@ class TestShape(DirectApiTestCase):
         box2 = Box(10, 10, 10)
         box.label = "box"
         box.color = Color("Red")
-        box.joints = ["j1", "j2"]
         box.children = [Box(1, 1, 1), Box(2, 2, 2)]
         box.topo_parent = box2
 
         blank = Compound()
-        box.copy_attributes_to(
-            blank, ["color", "label", "joints", "children", "topo_parent"]
-        )
+        box.copy_attributes_to(blank)
         self.assertEqual(blank.label, "box")
         self.assertTrue(all(c1 == c2 for c1, c2 in zip(blank.color, Color("Red"))))
-        self.assertTrue(all(j1 == j2 for j1, j2 in zip(blank.joints, ["j1", "j2"])))
         self.assertTrue(all(c1 == c2 for c1, c2 in zip(blank.children, box.children)))
         self.assertEqual(blank.topo_parent, box2)
-
-        with self.assertRaises(ValueError):
-            box.copy_attributes_to(blank, ["invalid"])
-
-        with self.assertWarns(UserWarning):
-            box.copy_attributes_to(Edge.make_line((0, 0), (1, 1)), ["joints"])
 
 
 class TestShapeList(DirectApiTestCase):
@@ -3527,10 +3618,12 @@ class TestShapeList(DirectApiTestCase):
         sl = ShapeList([Face.make_rect(1, 1), Face.make_rect(1, 1, Plane((4, 4)))])
         with self.assertWarns(UserWarning):
             sl.vertex()
+        self.assertEqual(len(Edge().vertices()), 0)
 
     def test_edges(self):
         sl = ShapeList([Face.make_rect(1, 1), Face.make_rect(1, 1, Plane((4, 4)))])
         self.assertEqual(len(sl.edges()), 8)
+        self.assertEqual(len(Edge().edges()), 0)
 
     def test_edge(self):
         sl = ShapeList([Edge.make_circle(1)])
@@ -3542,6 +3635,7 @@ class TestShapeList(DirectApiTestCase):
     def test_wires(self):
         sl = ShapeList([Face.make_rect(1, 1), Face.make_rect(1, 1, Plane((4, 4)))])
         self.assertEqual(len(sl.wires()), 2)
+        self.assertEqual(len(Wire().wires()), 0)
 
     def test_wire(self):
         sl = ShapeList([Wire.make_circle(1)])
@@ -3553,6 +3647,7 @@ class TestShapeList(DirectApiTestCase):
     def test_faces(self):
         sl = ShapeList([Solid.make_box(1, 1, 1), Solid.make_cylinder(1, 1)])
         self.assertEqual(len(sl.faces()), 9)
+        self.assertEqual(len(Face().faces()), 0)
 
     def test_face(self):
         sl = ShapeList(
@@ -3566,6 +3661,7 @@ class TestShapeList(DirectApiTestCase):
     def test_shells(self):
         sl = ShapeList([Solid.make_box(1, 1, 1), Solid.make_cylinder(1, 1)])
         self.assertEqual(len(sl.shells()), 2)
+        self.assertEqual(len(Shell().shells()), 0)
 
     def test_shell(self):
         sl = ShapeList([Vertex(1, 1, 1), Solid.make_box(1, 1, 1)])
@@ -3577,6 +3673,7 @@ class TestShapeList(DirectApiTestCase):
     def test_solids(self):
         sl = ShapeList([Solid.make_box(1, 1, 1), Solid.make_cylinder(1, 1)])
         self.assertEqual(len(sl.solids()), 2)
+        self.assertEqual(len(Solid().solids()), 0)
 
     def test_solid(self):
         sl = ShapeList([Solid.make_box(1, 1, 1), Solid.make_cylinder(1, 1)])
@@ -3588,6 +3685,7 @@ class TestShapeList(DirectApiTestCase):
     def test_compounds(self):
         sl = ShapeList([Box(1, 1, 1), Cylinder(1, 1)])
         self.assertEqual(len(sl.compounds()), 2)
+        self.assertEqual(len(Compound().compounds()), 0)
 
     def test_compound(self):
         sl = ShapeList([Box(1, 1, 1), Cylinder(1, 1)])
@@ -3664,6 +3762,26 @@ class TestShells(DirectApiTestCase):
         self.assertEqual(len(sweep_c2_c1.faces()), 2)
         self.assertEqual(len(sweep_w_w.faces()), 4)
         self.assertEqual(len(sweep_c2_c2.faces()), 4)
+
+    def test_make_loft(self):
+        r = 3
+        h = 2
+        loft = Shell.make_loft(
+            [Wire.make_circle(r, Plane((0, 0, h))), Wire.make_circle(r)]
+        )
+        self.assertEqual(loft.volume, 0, "A shell has no volume")
+        cylinder_area = 2 * math.pi * r * h
+        self.assertAlmostEqual(loft.area, cylinder_area)
+
+    def test_thicken(self):
+        rect = Wire.make_rect(10, 5)
+        shell: Shell = Shape.extrude(rect, Vector(0, 0, 3))
+        thick = shell.thicken(1)
+
+        self.assertEqual(isinstance(thick, Solid), True)
+        inner_vol = 3 * 10 * 5
+        outer_vol = 3 * 12 * 7
+        self.assertAlmostEqual(thick.volume, outer_vol - inner_vol)
 
 
 class TestSolid(DirectApiTestCase):
@@ -3790,6 +3908,30 @@ class TestSolid(DirectApiTestCase):
 
         with self.assertRaises(ValueError):
             Solid.make_loft([Wire.make_rect(1, 1)])
+
+    def test_make_loft_with_vertices(self):
+        loft = Solid.make_loft(
+            [Vertex(0, 0, -1), Wire.make_rect(1, 1.5), Vertex(0, 0, 1)], True
+        )
+        self.assertAlmostEqual(loft.volume, 1, 5)
+
+        with self.assertRaises(ValueError):
+            Solid.make_loft(
+                [Wire.make_rect(1, 1), Vertex(0, 0, 1), Wire.make_rect(1, 1)]
+            )
+
+        with self.assertRaises(ValueError):
+            Solid.make_loft([Vertex(0, 0, 1), Vertex(0, 0, 2)])
+
+        with self.assertRaises(ValueError):
+            Solid.make_loft(
+                [
+                    Vertex(0, 0, 1),
+                    Wire.make_rect(1, 1),
+                    Vertex(0, 0, 2),
+                    Vertex(0, 0, 3),
+                ]
+            )
 
     def test_extrude_until(self):
         square = Face.make_rect(1, 1)
