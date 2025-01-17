@@ -5,7 +5,17 @@
 [![Documentation Status](https://readthedocs.org/projects/build123d/badge/?version=latest)](https://build123d.readthedocs.io/en/latest/?badge=latest)
 [![tests](https://github.com/gumyr/build123d/actions/workflows/test.yml/badge.svg)](https://github.com/gumyr/build123d/actions/workflows/test.yml)
 [![pylint](https://github.com/gumyr/build123d/actions/workflows/lint.yml/badge.svg)](https://github.com/gumyr/build123d/actions/workflows/lint.yml)
+[![mypy](https://github.com/gumyr/build123d/actions/workflows/mypy.yml/badge.svg)](https://github.com/gumyr/build123d/actions/workflows/mypy.yml)
 [![codecov](https://codecov.io/gh/gumyr/build123d/branch/dev/graph/badge.svg)](https://codecov.io/gh/gumyr/build123d)
+
+![Python Versions](https://img.shields.io/badge/python-3.10%20|%203.11%20|%203.12%20|%203.13-blue)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
+[![PyPI version](https://img.shields.io/pypi/v/build123d.svg)](https://pypi.org/project/build123d/)
+[![Downloads](https://pepy.tech/badge/build123d)](https://pepy.tech/project/build123d)
+[![Downloads/month](https://pepy.tech/badge/build123d/month)](https://pepy.tech/project/build123d)
+[![PyPI - Wheel](https://img.shields.io/pypi/wheel/build123d.svg)](https://pypi.org/project/build123d/)
 
 Build123d is a python-based, parametric, boundary representation (BREP) modeling framework for 2D and 3D CAD. It's built on the Open Cascade geometric kernel and allows for the creation of complex models using a simple and intuitive python syntax. Build123d can be used to create models for 3D printing, CNC machining, laser cutting, and other manufacturing processes.  Models can be exported to a wide variety of popular CAD tools such as FreeCAD and SolidWorks.
 
@@ -20,7 +30,7 @@ The recommended method for most users is to install **build123d** is:
 pip install build123d
 ```
 
-To get the latest non-released version of **build123d*** one can install from GitHub using one of the following two commands:
+To get the latest non-released version of **build123d** one can install from GitHub using one of the following two commands:
 
 In Linux/MacOS, use the following command:
 ```
@@ -43,4 +53,4 @@ cd build123d
 python3 -m pip install -e .
 ```
 
-Further installation instructions are available (e.g. Poetry, Apple Silicon) see the [installation section on readthedocs](https://build123d.readthedocs.io/en/latest/installation.html).
+Further installation instructions are available (e.g. Poetry) see the [installation section on readthedocs](https://build123d.readthedocs.io/en/latest/installation.html).

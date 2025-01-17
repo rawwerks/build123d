@@ -50,8 +50,10 @@ import functools
 from abc import ABC, abstractmethod
 from itertools import product
 from math import sqrt, cos, pi
-from typing import Any, Callable, Iterable, Optional, Union, TypeVar
-from typing_extensions import Self, ParamSpec, Concatenate
+from typing import Any, cast, overload, Type, TypeVar
+
+from collections.abc import Callable, Iterable
+from typing_extensions import Self
 
 from build123d.build_enums import Align, Mode, Select, Unit
 from build123d.geometry import (
@@ -67,6 +69,7 @@ from build123d.topology import (
     Curve,
     Edge,
     Face,
+    Joint,
     Part,
     Shape,
     ShapeList,
@@ -133,10 +136,10 @@ def _is_point(obj):
 T = TypeVar("T", Any, list[Any])
 
 
-def flatten_sequence(*obj: T) -> list[Any]:
+def flatten_sequence(*obj: T) -> ShapeList[Any]:
     """Convert a sequence of object potentially containing iterables into a flat list"""
 
-    flat_list = []
+    flat_list: ShapeList[Any] = ShapeList()
     for item in obj:
         # Note: an Iterable can't be used here as it will match with Vector & Vertex
         # and break them into a list of floats.
@@ -171,6 +174,9 @@ operations_apply_to = {
     "thicken": ["BuildPart"],
 }
 
+B = TypeVar("B", bound="Builder")
+"""Builder type hint"""
+
 
 class Builder(ABC):
     """Builder
@@ -191,20 +197,46 @@ class Builder(ABC):
     # pylint: disable=too-many-instance-attributes
 
     # Context variable used to by Objects and Operations to link to current builder instance
-    _current: contextvars.ContextVar["Builder"] = contextvars.ContextVar(
+    _current: contextvars.ContextVar[Builder] = contextvars.ContextVar(
         "Builder._current"
     )
 
     # Abstract class variables
     _tag = "Builder"
     _obj_name = "None"
-    _shape = None
-    _sub_class = None
+    # _shape: Shape  # The type of the shape the builder creates
+    # _sub_class: Curve | Sketch | Part  # The class of the shape the builder creates
+
+    def __init__(
+        self,
+        *workplanes: Face | Plane | Location,
+        mode: Mode = Mode.ADD,
+    ):
+        self.mode = mode
+        planes = WorkplaneList._convert_to_planes(workplanes)
+        self.workplanes = planes if planes else [Plane.XY]
+        self._reset_tok = None
+        current_frame = inspect.currentframe()
+        assert current_frame is not None
+        assert current_frame.f_back is not None
+        self._python_frame = current_frame.f_back.f_back
+        self.parent_frame = None
+        self.builder_parent = None
+        self.lasts: dict = {Vertex: [], Edge: [], Face: [], Solid: []}
+        self.workplanes_context = None
+        self.exit_workplanes: list[Plane] = []
+        self.obj_before: Shape | None = None
+        self.to_combine: list[Shape] = []
 
     @property
     @abstractmethod
     def _obj(self) -> Shape:
         """Object to pass to parent"""
+        raise NotImplementedError  # pragma: no cover
+
+    @_obj.setter
+    @abstractmethod
+    def _obj(self, value: Part) -> None:
         raise NotImplementedError  # pragma: no cover
 
     @property
@@ -217,28 +249,6 @@ class Builder(ABC):
         """Edges that changed during last operation"""
         before_list = [] if self.obj_before is None else [self.obj_before]
         return new_edges(*(before_list + self.to_combine), combined=self._obj)
-
-    def __init__(
-        self,
-        *workplanes: Union[Face, Plane, Location],
-        mode: Mode = Mode.ADD,
-    ):
-        self.mode = mode
-        planes = WorkplaneList._convert_to_planes(workplanes)
-        self.workplanes = planes if planes else [Plane.XY]
-        self._reset_tok = None
-        current_frame = inspect.currentframe()
-        assert current_frame is not None
-        assert current_frame.f_back is not None
-        self._python_frame = current_frame.f_back.f_back
-        self._python_frame_code = self._python_frame.f_code
-        self.parent_frame = None
-        self.builder_parent = None
-        self.lasts: dict = {Vertex: [], Edge: [], Face: [], Solid: []}
-        self.workplanes_context = None
-        self.exit_workplanes = None
-        self.obj_before: Optional[Shape] = None
-        self.to_combine: list[Shape] = []
 
     def __enter__(self):
         """Upon entering record the parent and a token to restore contextvars"""
@@ -305,12 +315,16 @@ class Builder(ABC):
         logger.info("Exiting %s", type(self).__name__)
 
     @abstractmethod
-    def _add_to_pending(self, *objects: Union[Edge, Face], face_plane: Plane = None):
+    def _add_to_pending(self, *objects: Edge | Face, face_plane: Plane | None = None):
         """Integrate a sequence of objects into existing builder object"""
         return NotImplementedError  # pragma: no cover
 
     @classmethod
-    def _get_context(cls, caller: Union[Builder, str] = None, log: bool = True) -> Self:
+    def _get_context(
+        cls: Type[B],
+        caller: Builder | Shape | Joint | str | None = None,
+        log: bool = True,
+    ) -> B | None:
         """Return the instance of the current builder"""
         result = cls._current.get(None)
         context_name = "None" if result is None else type(result).__name__
@@ -324,11 +338,11 @@ class Builder(ABC):
                 caller_name = "None"
             logger.info("%s context requested by %s", context_name, caller_name)
 
-        return result
+        return cast(B, result)
 
     def _add_to_context(
         self,
-        *objects: Union[Edge, Wire, Face, Solid, Compound],
+        *objects: Edge | Wire | Face | Solid | Compound,
         faces_to_pending: bool = True,
         clean: bool = True,
         mode: Mode = Mode.ADD,
@@ -361,8 +375,11 @@ class Builder(ABC):
         self.obj_before = self._obj
         self.to_combine = list(objects)
         if mode != Mode.PRIVATE and len(objects) > 0:
-            # Categorize the input objects by type
-            typed = {}
+            # Typed dictionary: keys are classes, values are lists of instances of those classes
+            typed: dict[
+                Type[Edge | Wire | Face | Solid | Compound],
+                list[Edge | Wire | Face | Solid | Compound],
+            ] = {cls: [] for cls in [Edge, Wire, Face, Solid, Compound]}
             for cls in [Edge, Wire, Face, Solid, Compound]:
                 typed[cls] = [obj for obj in objects if isinstance(obj, cls)]
 
@@ -370,7 +387,7 @@ class Builder(ABC):
             num_stored = sum(len(t) for t in typed.values())
             # Generate an exception if not processing exceptions
             if len(objects) != num_stored and not sys.exc_info()[1]:
-                unsupported = set(objects) - set(v for l in typed.values() for v in l)
+                unsupported = set(objects) - {v for l in typed.values() for v in l}
                 if unsupported != {None}:
                     raise ValueError(f"{self._tag} doesn't accept {unsupported}")
 
@@ -425,27 +442,42 @@ class Builder(ABC):
                     len(typed[self._shape]),
                     mode,
                 )
-
+                combined: Shape | list[Shape] | None
                 if mode == Mode.ADD:
                     if self._obj is None:
                         if len(typed[self._shape]) == 1:
-                            self._obj = typed[self._shape][0]
+                            combined = typed[self._shape][0]
                         else:
-                            self._obj = (
+                            combined = (
                                 typed[self._shape].pop().fuse(*typed[self._shape])
                             )
                     else:
-                        self._obj = self._obj.fuse(*typed[self._shape])
+                        combined = self._obj.fuse(*typed[self._shape])
                 elif mode == Mode.SUBTRACT:
                     if self._obj is None:
                         raise RuntimeError("Nothing to subtract from")
-                    self._obj = self._obj.cut(*typed[self._shape])
+                    combined = self._obj.cut(*typed[self._shape])
                 elif mode == Mode.INTERSECT:
                     if self._obj is None:
                         raise RuntimeError("Nothing to intersect with")
-                    self._obj = self._obj.intersect(*typed[self._shape])
+                    combined = self._obj.intersect(*typed[self._shape])
                 elif mode == Mode.REPLACE:
-                    self._obj = Compound(list(typed[self._shape]))
+                    combined = self._sub_class(list(typed[self._shape]))
+
+                if combined is None:  # empty intersection result
+                    self._obj = self._sub_class()
+                elif isinstance(
+                    combined, list
+                ):  # If the boolean operation created a list, convert back
+                    self._obj = self._sub_class(combined)
+                else:
+                    self._obj = combined
+                # If the boolean operation created a list, convert back
+                # self._obj = (
+                #     self._sub_class(combined)
+                #     if isinstance(combined, list)
+                #     else combined
+                # )
 
                 if self._obj is not None and clean:
                     self._obj = self._obj.clean()
@@ -706,7 +738,10 @@ class Builder(ABC):
             )
         return all_solids[0]
 
-    def _shapes(self, obj_type: Union[Vertex, Edge, Face, Solid] = None) -> ShapeList:
+    def _shapes(
+        self,
+        obj_type: Type[Vertex] | Type[Edge] | Type[Face] | Type[Solid] | None = None,
+    ) -> ShapeList:
         """Extract Shapes"""
         obj_type = self._shape if obj_type is None else obj_type
         if obj_type == Vertex:
@@ -722,7 +757,7 @@ class Builder(ABC):
         return result
 
     def validate_inputs(
-        self, validating_class, objects: Union[Shape, Iterable[Shape]] = None
+        self, validating_class, objects: Shape | Iterable[Shape] | None = None
     ):
         """Validate that objects/operations and parameters apply"""
 
@@ -772,15 +807,15 @@ class Builder(ABC):
 
     def __add__(self, _other) -> Self:
         """Invalid add"""
-        self._invalid_combine()
+        return self._invalid_combine()
 
     def __sub__(self, _other) -> Self:
         """Invalid sub"""
-        self._invalid_combine()
+        return self._invalid_combine()
 
     def __and__(self, _other) -> Self:
         """Invalid and"""
-        self._invalid_combine()
+        return self._invalid_combine()
 
     def __getattr__(self, name):
         """The user is likely trying to reference the builder's object"""
@@ -791,7 +826,7 @@ class Builder(ABC):
 
 
 def validate_inputs(
-    context: Builder, validating_class, objects: Iterable[Shape] = None
+    context: Builder | None, validating_class, objects: Iterable[Shape] | None = None
 ):
     """A function to wrap the method when used outside of a Builder context"""
     if context is None:
@@ -814,7 +849,7 @@ class LocationList:
     """
 
     # Context variable used to link to LocationList instance
-    _current: contextvars.ContextVar["LocationList"] = contextvars.ContextVar(
+    _current: contextvars.ContextVar[LocationList] = contextvars.ContextVar(
         "ContextList._current"
     )
 
@@ -924,7 +959,7 @@ class HexLocations(LocationList):
         x_count: int,
         y_count: int,
         major_radius: bool = False,
-        align: Union[Align, tuple[Align, Align]] = (Align.CENTER, Align.CENTER),
+        align: Align | tuple[Align, Align] = (Align.CENTER, Align.CENTER),
     ):
         # pylint: disable=too-many-locals
 
@@ -1020,7 +1055,7 @@ class PolarLocations(LocationList):
         if count < 1:
             raise ValueError(f"At least 1 elements required, requested {count}")
         if count == 1:
-            angle_step = 0
+            angle_step = 0.0
         else:
             angle_step = angular_range / (count - int(endpoint))
 
@@ -1058,15 +1093,15 @@ class Locations(LocationList):
 
     def __init__(
         self,
-        *pts: Union[
-            VectorLike,
-            Vertex,
-            Location,
-            Face,
-            Plane,
-            Axis,
-            Iterable[VectorLike, Vertex, Location, Face, Plane, Axis],
-        ],
+        *pts: (
+            VectorLike
+            | Vertex
+            | Location
+            | Face
+            | Plane
+            | Axis
+            | Iterable[VectorLike | Vertex | Location | Face | Plane | Axis]
+        ),
     ):
         local_locations = []
         for point in flatten_sequence(*pts):
@@ -1148,7 +1183,7 @@ class GridLocations(LocationList):
         y_spacing: float,
         x_count: int,
         y_count: int,
-        align: Union[Align, tuple[Align, Align]] = (Align.CENTER, Align.CENTER),
+        align: Align | tuple[Align, Align] = (Align.CENTER, Align.CENTER),
     ):
         if x_count < 1 or y_count < 1:
             raise ValueError(
@@ -1202,18 +1237,18 @@ class WorkplaneList:
     """
 
     # Context variable used to link to WorkplaneList instance
-    _current: contextvars.ContextVar["WorkplaneList"] = contextvars.ContextVar(
+    _current: contextvars.ContextVar[WorkplaneList] = contextvars.ContextVar(
         "WorkplaneList._current"
     )
 
-    def __init__(self, *workplanes: Union[Face, Plane, Location]):
+    def __init__(self, *workplanes: Face | Plane | Location):
         self._reset_tok = None
         self.workplanes = WorkplaneList._convert_to_planes(workplanes)
         self.locations_context = None
         self.plane_index = 0
 
     @staticmethod
-    def _convert_to_planes(objs: Iterable[Union[Face, Plane, Location]]) -> list[Plane]:
+    def _convert_to_planes(objs: Iterable[Face | Plane | Location]) -> list[Plane]:
         """Translate objects to planes"""
         objs = flatten_sequence(*objs)
         planes = []
@@ -1264,8 +1299,16 @@ class WorkplaneList:
         """Return the instance of the current ContextList"""
         return cls._current.get(None)
 
+    @overload
     @classmethod
-    def localize(cls, *points: VectorLike) -> Union[list[Vector], Vector]:
+    def localize(cls, points: VectorLike) -> Vector: ...  # type: ignore[overload-overlap]
+
+    @overload
+    @classmethod
+    def localize(cls, *points: VectorLike) -> list[Vector]: ...
+
+    @classmethod  # type: ignore[misc]
+    def localize(cls, *points: VectorLike):
         """Localize a sequence of points to the active workplane
         (only used by BuildLine where there is only one active workplane)
 
@@ -1279,7 +1322,11 @@ class WorkplaneList:
             points_per_workplane = []
             workplane = WorkplaneList._get_context().workplanes[0]
             localized_pts = [
-                workplane.from_local_coords(pt) if isinstance(pt, tuple) else pt
+                (
+                    cast(Vector, workplane.from_local_coords(Vector(pt)))
+                    if isinstance(pt, tuple)
+                    else Vector(pt)
+                )
                 for pt in points
             ]
             if len(localized_pts) == 1:
@@ -1288,31 +1335,54 @@ class WorkplaneList:
                 points_per_workplane.extend(localized_pts)
 
         if len(points_per_workplane) == 1:
-            result = points_per_workplane[0]
-        else:
-            result = points_per_workplane
-        return result
+            return points_per_workplane[0]
+        return points_per_workplane
 
 
-P = ParamSpec("P")
+# Type variable representing the return type of the wrapped function
 T2 = TypeVar("T2")
 
 
 def __gen_context_component_getter(
-    func: Callable[Concatenate[Builder, P], T2],
-) -> Callable[P, T2]:
+    func: Callable[[Builder, Select], T2]
+) -> Callable[[Select], T2]:
+    """
+    Wraps a Builder method to automatically provide the Builder context.
+
+    This function creates a wrapper around the provided Builder method (`func`) that
+    automatically retrieves the current Builder context and passes it as the first
+    argument to the method. This allows the method to be called without explicitly
+    providing the Builder context.
+
+    Args:
+        func (Callable[[Builder, Select], T2]): The Builder method to be wrapped.
+            - The method must take a `Builder` instance as its first argument and
+              a `Select` instance as its second argument.
+
+    Returns:
+        Callable[[Select], T2]: A callable that takes only a `Select` argument and
+        internally retrieves the Builder context to call the original method.
+
+    Raises:
+        RuntimeError: If no Builder context is available when the returned function
+        is called.
+    """
+
     @functools.wraps(func)
-    def getter(select: Select = Select.ALL):
+    def getter(select: Select = Select.ALL) -> T2:
+        # Retrieve the current Builder context based on the method name
         context = Builder._get_context(func.__name__)
         if not context:
             raise RuntimeError(
                 f"{func.__name__}() requires a Builder context to be in scope"
             )
+        # Call the original method with the retrieved context and provided select
         return func(context, select)
 
     return getter
 
 
+# The following functions are used to get the shapes from the builder in context
 vertices = __gen_context_component_getter(Builder.vertices)
 edges = __gen_context_component_getter(Builder.edges)
 wires = __gen_context_component_getter(Builder.wires)

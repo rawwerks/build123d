@@ -81,15 +81,17 @@ license:
 
 # pylint has trouble with the OCP imports
 # pylint: disable=no-name-in-module, import-error
-import copy
+import copy as copy_module
 import ctypes
 import math
 import os
 import sys
-import uuid
 import warnings
 from os import PathLike, fsdecode
-from typing import Iterable, Union
+from typing import Union
+from uuid import UUID
+
+from collections.abc import Iterable
 
 import OCP.TopAbs as ta
 from OCP.BRep import BRep_Tool
@@ -214,7 +216,7 @@ class Mesher:
         name space `build123d`, name equal to the base file name and the type
         as `python`"""
         caller_file = sys._getframe().f_back.f_code.co_filename
-        with open(caller_file, mode="r", encoding="utf-8") as code_file:
+        with open(caller_file, encoding="utf-8") as code_file:
             source_code = code_file.read()  # read whole file to a string
 
         self.add_meta_data(
@@ -293,6 +295,8 @@ class Mesher:
                 ocp_mesh_vertices.append(pnt)
 
             # Store the triangles from the triangulated faces
+            if facet.wrapped is None:
+                continue
             facet_reversed = facet.wrapped.Orientation() == ta.TopAbs_REVERSED
             order = [1, 3, 2] if facet_reversed else [1, 2, 3]
             for tri in poly_triangulation.Triangles():
@@ -303,41 +307,47 @@ class Mesher:
     @staticmethod
     def _create_3mf_mesh(
         ocp_mesh_vertices: list[tuple[float, float, float]],
-        triangles: list[list[int, int, int]],
+        triangles: list[list[int]],
     ):
         # Round off the vertices to avoid vertices within tolerance being
         # considered as different vertices
         digits = -int(round(math.log(TOLERANCE, 10), 1))
-        ocp_mesh_vertices = [
-            (round(x, digits), round(y, digits), round(z, digits))
-            for x, y, z in ocp_mesh_vertices
+        
+        # Create vertex to index mapping directly
+        vertex_to_idx = {}
+        next_idx = 0
+        vert_table = {}
+        
+        # First pass - create mapping
+        for i, (x, y, z) in enumerate(ocp_mesh_vertices):
+            key = (round(x, digits), round(y, digits), round(z, digits))
+            if key not in vertex_to_idx:
+                vertex_to_idx[key] = next_idx
+                next_idx += 1
+            vert_table[i] = vertex_to_idx[key]
+        
+        # Create vertices array in one shot
+        vertices_3mf = [
+            Lib3MF.Position((ctypes.c_float * 3)(*v))
+            for v in vertex_to_idx.keys()
         ]
-        """Create the data to create a 3mf mesh"""
-        # Create a lookup table of face vertex to shape vertex
-        unique_vertices = list(set(ocp_mesh_vertices))
-        vert_table = {
-            i: unique_vertices.index(pnt) for i, pnt in enumerate(ocp_mesh_vertices)
-        }
-
-        # Create vertex list of 3MF positions
-        vertices_3mf = []
-        for pnt in unique_vertices:
-            c_array = (ctypes.c_float * 3)(*pnt)
-            vertices_3mf.append(Lib3MF.Position(c_array))
-            # mesh_3mf.AddVertex  Should AddVertex be used to save memory?
-
-        # Create triangle point list
+        
+        # Pre-allocate triangles array and process in bulk
+        c_uint3 = ctypes.c_uint * 3
         triangles_3mf = []
-        for vertex_indices in triangles:
-            mapped_indices = [
-                vert_table[i] for i in [vertex_indices[i] for i in range(3)]
-            ]
-            # Remove degenerate triangles
-            if len(set(mapped_indices)) != 3:
-                continue
-            c_array = (ctypes.c_uint * 3)(*mapped_indices)
-            triangles_3mf.append(Lib3MF.Triangle(c_array))
-
+        
+        # Process triangles in bulk
+        for tri in triangles:
+            # Map indices directly without list comprehension
+            a, b, c = tri[0], tri[1], tri[2]
+            mapped_a = vert_table[a]
+            mapped_b = vert_table[b]
+            mapped_c = vert_table[c]
+            
+            # Quick degenerate check without set creation
+            if mapped_a != mapped_b and mapped_b != mapped_c and mapped_c != mapped_a:
+                triangles_3mf.append(Lib3MF.Triangle(c_uint3(mapped_a, mapped_b, mapped_c)))
+        
         return (vertices_3mf, triangles_3mf)
 
     def _add_color(self, b3d_shape: Shape, mesh_3mf: Lib3MF.MeshObject):
@@ -354,12 +364,12 @@ class Mesher:
 
     def add_shape(
         self,
-        shape: Union[Shape, Iterable[Shape]],
+        shape: Shape | Iterable[Shape],
         linear_deflection: float = 0.001,
         angular_deflection: float = 0.1,
         mesh_type: MeshType = MeshType.MODEL,
-        part_number: str = None,
-        uuid_value: uuid = None,
+        part_number: str | None = None,
+        uuid_value: UUID | None = None,
     ):
         """add_shape
 
@@ -392,7 +402,7 @@ class Mesher:
 
             # Mesh the shape
             ocp_mesh_vertices, triangles = Mesher._mesh_shape(
-                copy.deepcopy(b3d_shape),
+                copy_module.deepcopy(b3d_shape),
                 linear_deflection,
                 angular_deflection,
             )
@@ -483,7 +493,7 @@ class Mesher:
 
         return shape_obj
 
-    def read(self, file_name: Union[PathLike, str, bytes]) -> list[Shape]:
+    def read(self, file_name: PathLike | str | bytes) -> list[Shape]:
         """read
 
         Args:
@@ -505,7 +515,6 @@ class Mesher:
 
         # Extract 3MF meshes and translate to OCP meshes
         mesh_iterator: Lib3MF.MeshObjectIterator = self.model.GetMeshObjects()
-        self.meshes: list[Lib3MF.MeshObject]
         for _i in range(mesh_iterator.Count()):
             mesh_iterator.MoveNext()
             self.meshes.append(mesh_iterator.GetCurrentMeshObject())
@@ -527,7 +536,7 @@ class Mesher:
 
         return shapes
 
-    def write(self, file_name: Union[PathLike, str, bytes]):
+    def write(self, file_name: PathLike | str | bytes):
         """write
 
         Args:

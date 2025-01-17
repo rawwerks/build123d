@@ -31,10 +31,12 @@ license:
 
 import os
 from os import PathLike, fsdecode
+import re
 import unicodedata
 from math import degrees
 from pathlib import Path
-from typing import Optional, TextIO, Union
+from typing import Literal, Optional, TextIO, Union
+import warnings
 
 from OCP.BRep import BRep_Builder
 from OCP.BRepGProp import BRepGProp
@@ -93,7 +95,7 @@ topods_lut = {
 }
 
 
-def import_brep(file_name: Union[PathLike, str, bytes]) -> Shape:
+def import_brep(file_name: PathLike | str | bytes) -> Shape:
     """Import shape from a BREP file
 
     Args:
@@ -108,15 +110,16 @@ def import_brep(file_name: Union[PathLike, str, bytes]) -> Shape:
     shape = TopoDS_Shape()
     builder = BRep_Builder()
 
-    BRepTools.Read_s(shape, fsdecode(file_name), builder)
+    file_name_str = fsdecode(file_name)
+    BRepTools.Read_s(shape, file_name_str, builder)
 
     if shape.IsNull():
-        raise ValueError(f"Could not import {file_name}")
+        raise ValueError(f"Could not import {file_name_str}")
 
-    return Shape.cast(shape)
+    return Compound.cast(shape)
 
 
-def import_step(filename: Union[PathLike, str, bytes]) -> Compound:
+def import_step(filename: PathLike | str | bytes) -> Compound:
     """import_step
 
     Extract shapes from a STEP file and return them as a Compound object.
@@ -173,7 +176,7 @@ def import_step(filename: Union[PathLike, str, bytes]) -> Compound:
 
         return shape_color
 
-    def build_assembly(parent_tdf_label: Optional[TDF_Label] = None) -> list[Shape]:
+    def build_assembly(parent_tdf_label: TDF_Label | None = None) -> list[Shape]:
         """Recursively extract object into an assembly"""
         sub_tdf_labels = TDF_LabelSequence()
         if parent_tdf_label is None:
@@ -219,7 +222,6 @@ def import_step(filename: Union[PathLike, str, bytes]) -> Compound:
     reader.Transfer(doc)
 
     root = Compound()
-    root.for_construction = None
     root.children = build_assembly()
     # Remove empty Compound wrapper if single free object
     if len(root.children) == 1:
@@ -228,7 +230,7 @@ def import_step(filename: Union[PathLike, str, bytes]) -> Compound:
     return root
 
 
-def import_stl(file_name: Union[PathLike, str, bytes]) -> Face:
+def import_stl(file_name: PathLike | str | bytes) -> Face:
     """import_stl
 
     Extract shape from an STL file and return it as a Face reference object.
@@ -255,7 +257,7 @@ def import_stl(file_name: Union[PathLike, str, bytes]) -> Face:
 
 
 def import_svg_as_buildline_code(
-    file_name: Union[PathLike, str, bytes],
+    file_name: PathLike | str | bytes,
 ) -> tuple[str, str]:
     """translate_to_buildline_code
 
@@ -332,23 +334,22 @@ def import_svg_as_buildline_code(
 
 
 def import_svg(
-    svg_file: Union[str, Path, TextIO],
+    svg_file: str | Path | TextIO,
     *,
     flip_y: bool = True,
     ignore_visibility: bool = False,
-    label_by: str = "id",
-    is_inkscape_label: bool = False,
-) -> ShapeList[Union[Wire, Face]]:
+    label_by: Literal["id", "class", "inkscape:label"] | str = "id",
+    is_inkscape_label: bool | None = None,  # TODO remove for `1.0` release
+) -> ShapeList[Wire | Face]:
     """import_svg
 
     Args:
         svg_file (Union[str, Path, TextIO]): svg file
         flip_y (bool, optional): flip objects to compensate for svg orientation. Defaults to True.
         ignore_visibility (bool, optional): Defaults to False.
-        label_by (str, optional): xml attribute. Defaults to "id".
-        is_inkscape_label (bool, optional): flag to indicate that the attribute
-            is an Inkscape label like `inkscape:label` - label_by would be set to
-            `label` in this case. Defaults to False.
+        label_by (str, optional): XML attribute to use for imported shapes' `label` property.
+            Defaults to "id".
+            Use `inkscape:label` to read labels set from Inkscape's "Layers and Objects" panel.
 
     Raises:
         ValueError: unexpected shape type
@@ -356,11 +357,16 @@ def import_svg(
     Returns:
         ShapeList[Union[Wire, Face]]: objects contained in svg
     """
+    if is_inkscape_label is not None:  # TODO remove for `1.0` release
+        msg = "`is_inkscape_label` parameter is deprecated"
+        if is_inkscape_label:
+            label_by = "inkscape:" + label_by
+            msg += f", use `label_by={label_by!r}` instead"
+        warnings.warn(msg, stacklevel=2)
+
     shapes = []
-    label_by = (
-        "{http://www.inkscape.org/namespaces/inkscape}" + label_by
-        if is_inkscape_label
-        else label_by
+    label_by = re.sub(
+        r"^inkscape:(.+)", r"{http://www.inkscape.org/namespaces/inkscape}\1", label_by
     )
     for face_or_wire, color_and_label in import_svg_document(
         svg_file,
