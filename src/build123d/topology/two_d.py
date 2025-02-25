@@ -57,12 +57,12 @@ from __future__ import annotations
 
 import copy
 import warnings
-from typing import Any, Tuple, Union, overload, TYPE_CHECKING
+from typing import Any, overload, TYPE_CHECKING
 
 from collections.abc import Iterable, Sequence
 
 import OCP.TopAbs as ta
-from OCP.BRep import BRep_Tool
+from OCP.BRep import BRep_Tool, BRep_Builder
 from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.BRepAlgo import BRepAlgo
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
@@ -73,9 +73,9 @@ from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet2d
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
 from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling, BRepOffsetAPI_MakePipeShell
-from OCP.BRepTools import BRepTools
+from OCP.BRepTools import BRepTools, BRepTools_ReShape
 from OCP.GProp import GProp_GProps
-from OCP.Geom import Geom_BezierSurface, Geom_Surface
+from OCP.Geom import Geom_BezierSurface, Geom_Surface, Geom_RectangularTrimmedSurface
 from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface, GeomAPI_ProjectPointOnSurf
 from OCP.GeomAbs import GeomAbs_C0
 from OCP.Precision import Precision
@@ -93,12 +93,14 @@ from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
 from OCP.TopoDS import TopoDS, TopoDS_Face, TopoDS_Shape, TopoDS_Shell, TopoDS_Solid
 from OCP.gce import gce_MakeLin
 from OCP.gp import gp_Pnt, gp_Vec
-from build123d.build_enums import CenterOf, GeomType, SortBy, Transition
+
+from build123d.build_enums import CenterOf, GeomType, Keep, SortBy, Transition
 from build123d.geometry import (
     TOLERANCE,
     Axis,
     Color,
     Location,
+    OrientedBoundBox,
     Plane,
     Vector,
     VectorLike,
@@ -355,6 +357,164 @@ class Face(Mixin2D, Shape[TopoDS_Face]):
     # ---- Properties ----
 
     @property
+    def area_without_holes(self) -> float:
+        """
+        Calculate the total surface area of the face, including the areas of any holes.
+
+        This property returns the overall area of the face as if the inner boundaries (holes)
+        were filled in.
+
+        Returns:
+            float: The total surface area, including the area of holes. Returns 0.0 if
+            the face is empty.
+        """
+        if self.wrapped is None:
+            return 0.0
+
+        return self.without_holes().area
+
+    @property
+    def axis_of_rotation(self) -> None | Axis:
+        """Get the rotational axis of a cylinder or torus"""
+        if type(self.geom_adaptor()) == Geom_RectangularTrimmedSurface:
+            return None
+
+        if self.geom_type == GeomType.CYLINDER:
+            return Axis(self.geom_adaptor().Cylinder().Axis())
+
+        if self.geom_type == GeomType.TORUS:
+            return Axis(self.geom_adaptor().Torus().Axis())
+
+        return None
+
+    @property
+    def axes_of_symmetry(self) -> list[Axis]:
+        """Computes and returns the axes of symmetry for a planar face.
+
+        The method determines potential symmetry axes by analyzing the face’s
+        geometry:
+        - It first validates that the face is non-empty and planar.
+        - For faces with inner wires (holes), it computes the centroid of the
+          holes and the face's overall center (COG).
+            If the holes' centroid significantly deviates from the COG (beyond
+            a specified tolerance), the symmetry axis is taken along the line
+            connecting these points; otherwise, each hole’s center is used to
+            generate a candidate axis.
+        - For faces without holes, candidate directions are derived by sampling
+          midpoints along the outer wire's edges.
+            If curved edges are present, additional candidate directions are
+            obtained from an oriented bounding box (OBB) constructed around the
+            face.
+
+        For each candidate direction, the face is split by a plane (defined
+        using the candidate direction and the face’s normal).  The top half of the face
+        is then mirrored across this plane, and if the area of the intersection between
+        the mirrored half and the bottom half matches the bottom half’s area within a
+        small tolerance, the direction is accepted as an axis of symmetry.
+
+        Returns:
+            list[Axis]: A list of Axis objects, each defined by the face's
+                center and a direction vector, representing the symmetry axes of
+                the face.
+
+        Raises:
+            ValueError: If the face or its underlying representation is empty.
+            ValueError: If the face is not planar.
+        """
+        if self.wrapped is None:
+            raise ValueError("Can't determine axes_of_symmetry of empty face")
+
+        if not self.is_planar_face:
+            raise ValueError("axes_of_symmetry only supports for planar faces")
+
+        cog = self.center()
+        normal = self.normal_at()
+        shape_inner_wires = self.inner_wires()
+        if shape_inner_wires:
+            hole_faces = [Face(w) for w in shape_inner_wires]
+            holes_centroid = Face.combined_center(hole_faces)
+            # If the holes aren't centered on the cog the axis of symmetry must be
+            # through the cog and hole centroid
+            if abs(holes_centroid - cog) > TOLERANCE:
+                cross_dirs = [(holes_centroid - cog).normalized()]
+            else:
+                # There may be an axis of symmetry through the center of the holes
+                cross_dirs = [(f.center() - cog).normalized() for f in hole_faces]
+        else:
+            curved_edges = (
+                self.outer_wire().edges().filter_by(GeomType.LINE, reverse=True)
+            )
+            shape_edges = self.outer_wire().edges()
+            if curved_edges:
+                obb = OrientedBoundBox(self)
+                corners = obb.corners
+                obb_edges = ShapeList(
+                    [Edge.make_line(corners[i], corners[(i + 1) % 4]) for i in range(4)]
+                )
+                mid_points = [
+                    e @ p for e in shape_edges + obb_edges for p in [0.0, 0.5, 1.0]
+                ]
+            else:
+                mid_points = [e @ p for e in shape_edges for p in [0.0, 0.5, 1.0]]
+            cross_dirs = [(mid_point - cog).normalized() for mid_point in mid_points]
+
+        symmetry_dirs: set[Vector] = set()
+        for cross_dir in cross_dirs:
+            # Split the face by the potential axis and flip the top
+            split_plane = Plane(
+                origin=cog,
+                x_dir=cross_dir,
+                z_dir=cross_dir.cross(normal),
+            )
+            # Split by plane
+            top, bottom = self.split(split_plane, keep=Keep.BOTH)
+
+            if type(top) != type(bottom):  # exit early if not same
+                continue
+
+            if top is None or bottom is None:  # Impossible to actually happen?
+                continue
+
+            top_list = ShapeList(top if isinstance(top, list) else [top])
+            bottom_list = ShapeList(bottom if isinstance(top, list) else [bottom])
+
+            if len(top_list) != len(bottom_list):  # exit early unequal length
+                continue
+
+            bottom_list = bottom_list.sort_by(Axis(cog, cross_dir))
+            top_flipped_list = ShapeList(
+                f.mirror(split_plane) for f in top_list
+            ).sort_by(Axis(cog, cross_dir))
+
+            bottom_area = sum(f.area for f in bottom_list)
+            intersect_area = 0.0
+            for flipped_face, bottom_face in zip(top_flipped_list, bottom_list):
+                intersection = flipped_face.intersect(bottom_face)
+                if intersection is None or isinstance(intersection, list):
+                    intersect_area = -1.0
+                    break
+                else:
+                    assert isinstance(intersection, Face)
+                    intersect_area += intersection.area
+
+            if intersect_area == -1.0:
+                continue
+
+            # Are the top/bottom the same?
+            if abs(intersect_area - bottom_area) < TOLERANCE:
+                if not symmetry_dirs:
+                    symmetry_dirs.add(cross_dir)
+                else:
+                    opposite = any(
+                        d.dot(cross_dir) < -1 + TOLERANCE for d in symmetry_dirs
+                    )
+                    if not opposite:
+                        symmetry_dirs.add(cross_dir)
+
+        symmetry_axes = [Axis(cog, d) for d in symmetry_dirs]
+        return symmetry_axes
+
+    @property
     def center_location(self) -> Location:
         """Location at the center of face"""
         origin = self.position_at(0.5, 0.5)
@@ -390,6 +550,69 @@ class Face(Mixin2D, Shape[TopoDS_Face]):
         return result
 
     @property
+    def _curvature_sign(self) -> float:
+        """
+        Compute the signed dot product between the face normal and the vector from the
+        underlying geometry's reference point to the face center.
+
+        For a cylinder, the reference is the cylinder’s axis position.
+        For a sphere, it is the sphere’s center.
+        For a torus, we derive a reference point on the central circle.
+
+        Returns:
+            float: The signed value; positive indicates convexity, negative indicates concavity.
+                Returns 0 if the geometry type is unsupported.
+        """
+        if self.geom_type == GeomType.CYLINDER:
+            axis = self.axis_of_rotation
+            if axis is None:
+                raise ValueError("Can't find curvature of empty object")
+            return self.normal_at().dot(self.center() - axis.position)
+
+        elif self.geom_type == GeomType.SPHERE:
+            loc = self.location  # The sphere's center
+            if loc is None:
+                raise ValueError("Can't find curvature of empty object")
+            return self.normal_at().dot(self.center() - loc.position)
+
+        elif self.geom_type == GeomType.TORUS:
+            # Here we assume that for a torus the rotational axis can be converted to a plane,
+            # and we then define the central (or core) circle using the first value of self.radii.
+            axis = self.axis_of_rotation
+            if axis is None or self.radii is None:
+                raise ValueError("Can't find curvature of empty object")
+            loc = Location(axis.to_plane())
+            axis_circle = Edge.make_circle(self.radii[0]).locate(loc)
+            _, pnt_on_axis_circle, _ = axis_circle.distance_to_with_closest_points(
+                self.center()
+            )
+            return self.normal_at().dot(self.center() - pnt_on_axis_circle)
+
+        return 0.0
+
+    @property
+    def is_circular_convex(self) -> bool:
+        """
+        Determine whether a given face is convex relative to its underlying geometry
+        for supported geometries: cylinder, sphere, torus.
+
+        Returns:
+            bool: True if convex; otherwise, False.
+        """
+        return self._curvature_sign > TOLERANCE
+
+    @property
+    def is_circular_concave(self) -> bool:
+        """
+        Determine whether a given face is concave relative to its underlying geometry
+        for supported geometries: cylinder, sphere, torus.
+
+        Returns:
+            bool: True if concave; otherwise, False.
+        """
+        return self._curvature_sign < -TOLERANCE
+
+    @property
     def is_planar(self) -> bool:
         """Is the face planar even though its geom_type may not be PLANE"""
         return self.is_planar_face
@@ -404,6 +627,28 @@ class Face(Mixin2D, Shape[TopoDS_Face]):
             face_vertices = flat_face.vertices().sort_by(Axis.X)
             result = face_vertices[-1].X - face_vertices[0].X
         return result
+
+    @property
+    def radii(self) -> None | tuple[float, float]:
+        """Return the major and minor radii of a torus otherwise None"""
+        if self.geom_type == GeomType.TORUS:
+            return (
+                self.geom_adaptor().MajorRadius(),
+                self.geom_adaptor().MinorRadius(),
+            )
+
+        return None
+
+    @property
+    def radius(self) -> None | float:
+        """Return the radius of a cylinder or sphere, otherwise None"""
+        if (
+            self.geom_type in [GeomType.CYLINDER, GeomType.SPHERE]
+            and type(self.geom_adaptor()) != Geom_RectangularTrimmedSurface
+        ):
+            return self.geom_adaptor().Radius()
+        else:
+            return None
 
     @property
     def volume(self) -> float:
@@ -1217,6 +1462,28 @@ class Face(Mixin2D, Shape[TopoDS_Face]):
 
         return self.__class__.cast(BRepAlgo.ConvertFace_s(self.wrapped, tolerance))
 
+    def without_holes(self) -> Face:
+        """without_holes
+
+        Remove all of the holes from this face.
+
+        Returns:
+            Face: A new Face instance identical to the original but without any holes.
+        """
+        if self.wrapped is None:
+            raise ValueError("Cannot remove holes from an empty face")
+
+        if not (inner_wires := self.inner_wires()):
+            return self
+
+        holeless = copy.deepcopy(self)
+        reshaper = BRepTools_ReShape()
+        for hole_wire in inner_wires:
+            reshaper.Remove(hole_wire.wrapped)
+        modified_shape = downcast(reshaper.Apply(self.wrapped))
+        holeless.wrapped = modified_shape
+        return holeless
+
     def wire(self) -> Wire:
         """Return the outerwire, generate a warning if inner_wires present"""
         if self.inner_wires():
@@ -1263,10 +1530,13 @@ class Shell(Mixin2D, Shape[TopoDS_Shell]):
             obj = obj_list[0]
 
         if isinstance(obj, Face):
-            builder = BRepBuilderAPI_MakeShell(
-                BRepAdaptor_Surface(obj.wrapped).Surface().Surface()
-            )
-            obj = builder.Shape()
+            if obj.wrapped is None:
+                raise ValueError(f"Can't create a Shell from empty Face")
+            builder = BRep_Builder()
+            shell = TopoDS_Shell()
+            builder.MakeShell(shell)
+            builder.Add(shell, obj.wrapped)
+            obj = shell
         elif isinstance(obj, Iterable):
             obj = _sew_topods_faces([f.wrapped for f in obj])
 

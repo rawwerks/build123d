@@ -106,7 +106,10 @@ Table Of Contents
     introduction.rst
     installation.rst
     key_concepts.rst
+    key_concepts_builder.rst
     key_concepts_algebra.rst
+    moving_objects.rst
+    OpenSCAD.rst
     introductory_examples.rst
     tutorials.rst
     objects.rst

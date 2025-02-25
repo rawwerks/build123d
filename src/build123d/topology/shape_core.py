@@ -68,7 +68,6 @@ from collections.abc import Callable, Iterable, Iterator
 import OCP.GeomAbs as ga
 import OCP.TopAbs as ta
 from IPython.lib.pretty import pretty, RepresentationPrinter
-from OCP.Aspect import Aspect_TOL_SOLID
 from OCP.BOPAlgo import BOPAlgo_GlueEnum
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
@@ -99,15 +98,11 @@ from OCP.BRepGProp import BRepGProp, BRepGProp_Face
 from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRepTools import BRepTools
-from OCP.Bnd import Bnd_Box
+from OCP.Bnd import Bnd_Box, Bnd_OBB
 from OCP.GProp import GProp_GProps
 from OCP.Geom import Geom_Line
 from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
 from OCP.GeomLib import GeomLib_IsPlanarSurface
-from OCP.IVtkOCC import IVtkOCC_Shape, IVtkOCC_ShapeMesher
-from OCP.IVtkVTK import IVtkVTK_ShapeData
-from OCP.Prs3d import Prs3d_IsoAspect
-from OCP.Quantity import Quantity_Color
 from OCP.ShapeAnalysis import ShapeAnalysis_Curve
 from OCP.ShapeCustom import ShapeCustom, ShapeCustom_RestrictionParameters
 from OCP.ShapeFix import ShapeFix_Shape
@@ -144,6 +139,7 @@ from build123d.geometry import (
     Color,
     Location,
     Matrix,
+    OrientedBoundBox,
     Plane,
     Vector,
     VectorLike,
@@ -152,8 +148,6 @@ from build123d.geometry import (
 from typing_extensions import Self
 
 from typing import Literal
-from vtkmodules.vtkCommonDataModel import vtkPolyData
-from vtkmodules.vtkFiltersCore import vtkPolyDataNormals, vtkTriangleFilter
 
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -450,6 +444,48 @@ class Shape(NodeMixin, Generic[TOPODS]):
             self.wrapped.Location(value.wrapped)
 
     @property
+    def matrix_of_inertia(self) -> list[list[float]]:
+        """
+        Compute the inertia matrix (moment of inertia tensor) of the shape.
+
+        The inertia matrix represents how the mass of the shape is distributed
+        with respect to its reference frame. It is a 3×3 symmetric tensor that
+        describes the resistance of the shape to rotational motion around
+        different axes.
+
+        Returns:
+            list[list[float]]: A 3×3 nested list representing the inertia matrix.
+            The elements of the matrix are given as:
+
+            | Ixx  Ixy  Ixz |
+            | Ixy  Iyy  Iyz |
+            | Ixz  Iyz  Izz |
+
+            where:
+            - Ixx, Iyy, Izz are the moments of inertia about the X, Y, and Z axes.
+            - Ixy, Ixz, Iyz are the products of inertia.
+
+        Example:
+            >>> obj = MyShape()
+            >>> obj.matrix_of_inertia
+            [[1000.0, 50.0, 0.0],
+            [50.0, 1200.0, 0.0],
+            [0.0, 0.0, 300.0]]
+
+        Notes:
+            - The inertia matrix is computed relative to the shape's center of mass.
+            - It is commonly used in structural analysis, mechanical simulations,
+              and physics-based motion calculations.
+        """
+        properties = GProp_GProps()
+        BRepGProp.VolumeProperties_s(self.wrapped, properties)
+        inertia_matrix = properties.MatrixOfInertia()
+        matrix = []
+        for i in range(3):
+            matrix.append([inertia_matrix.Value(i + 1, j + 1) for j in range(3)])
+        return matrix
+
+    @property
     def orientation(self) -> Vector | None:
         """Get the orientation component of this Shape's Location"""
         if self.location is None:
@@ -478,6 +514,59 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if loc is not None:
             loc.position = Vector(value)
             self.location = loc
+
+    @property
+    def principal_properties(self) -> list[tuple[Vector, float]]:
+        """
+        Compute the principal moments of inertia and their corresponding axes.
+
+        Returns:
+            list[tuple[Vector, float]]: A list of tuples, where each tuple contains:
+            - A `Vector` representing the axis of inertia.
+            - A `float` representing the moment of inertia for that axis.
+
+        Example:
+            >>> obj = MyShape()
+            >>> obj.principal_properties
+            [(Vector(1, 0, 0), 1200.0),
+            (Vector(0, 1, 0), 1000.0),
+            (Vector(0, 0, 1), 300.0)]
+        """
+        properties = GProp_GProps()
+        BRepGProp.VolumeProperties_s(self.wrapped, properties)
+        principal_props = properties.PrincipalProperties()
+        principal_moments = principal_props.Moments()
+        return [
+            (Vector(principal_props.FirstAxisOfInertia()), principal_moments[0]),
+            (Vector(principal_props.SecondAxisOfInertia()), principal_moments[1]),
+            (Vector(principal_props.ThirdAxisOfInertia()), principal_moments[2]),
+        ]
+
+    @property
+    def static_moments(self) -> tuple[float, float, float]:
+        """
+        Compute the static moments (first moments of mass) of the shape.
+
+        The static moments represent the weighted sum of the coordinates
+        with respect to the mass distribution, providing insight into the
+        center of mass and mass distribution of the shape.
+
+        Returns:
+            tuple[float, float, float]: The static moments (Mx, My, Mz),
+            where:
+            - Mx is the first moment of mass about the YZ plane.
+            - My is the first moment of mass about the XZ plane.
+            - Mz is the first moment of mass about the XY plane.
+
+        Example:
+            >>> obj = MyShape()
+            >>> obj.static_moments
+            (150.0, 200.0, 50.0)
+
+        """
+        properties = GProp_GProps()
+        BRepGProp.VolumeProperties_s(self.wrapped, properties)
+        return properties.StaticMoments()
 
     # ---- Class Methods ----
 
@@ -1415,6 +1504,16 @@ class Shape(NodeMixin, Generic[TOPODS]):
         shape_copy.wrapped = tcast(TOPODS, downcast(self.wrapped.Moved(loc.wrapped)))
         return shape_copy
 
+    def oriented_bounding_box(self) -> OrientedBoundBox:
+        """Create an oriented bounding box for this Shape.
+
+        Returns:
+            OrientedBoundBox: A box oriented and sized to contain this Shape
+        """
+        if self.wrapped is None:
+            return OrientedBoundBox(Bnd_OBB())
+        return OrientedBoundBox(self)
+
     def project_faces(
         self,
         faces: list[Face] | Compound,
@@ -1485,6 +1584,37 @@ class Shape(NodeMixin, Generic[TOPODS]):
         logger.debug("finished projecting '%d' faces", len(faces))
 
         return ShapeList(projected_faces)
+
+    def radius_of_gyration(self, axis: Axis) -> float:
+        """
+        Compute the radius of gyration of the shape about a given axis.
+
+        The radius of gyration represents the distance from the axis at which the entire
+        mass of the shape could be concentrated without changing its moment of inertia.
+        It provides insight into how mass is distributed relative to the axis and is
+        useful in structural analysis, rotational dynamics, and mechanical simulations.
+
+        Args:
+            axis (Axis): The axis about which the radius of gyration is computed.
+                        The axis should be defined in the same coordinate system
+                        as the shape.
+
+        Returns:
+            float: The radius of gyration in the same units as the shape's dimensions.
+
+        Example:
+            >>> obj = MyShape()
+            >>> axis = Axis((0, 0, 0), (0, 0, 1))
+            >>> obj.radius_of_gyration(axis)
+            5.47
+
+        Notes:
+            - The radius of gyration is computed based on the shape’s mass properties.
+            - It is useful for evaluating structural stability and rotational behavior.
+        """
+        properties = GProp_GProps()
+        BRepGProp.VolumeProperties_s(self.wrapped, properties)
+        return properties.RadiusOfGyration(axis.wrapped)
 
     def relocate(self, loc: Location):
         """Change the location of self while keeping it geometrically similar
@@ -1812,62 +1942,6 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         return self.__class__.cast(result)
 
-    def to_vtk_poly_data(
-        self,
-        tolerance: float | None = None,
-        angular_tolerance: float | None = None,
-        normals: bool = False,
-    ) -> vtkPolyData:
-        """Convert shape to vtkPolyData
-
-        Args:
-          tolerance: float:
-          angular_tolerance: float:  (Default value = 0.1)
-          normals: bool:  (Default value = True)
-
-        Returns: data object in VTK consisting of points, vertices, lines, and polygons
-        """
-        if self.wrapped is None:
-            raise ValueError("Cannot convert an empty shape")
-
-        vtk_shape = IVtkOCC_Shape(self.wrapped)
-        shape_data = IVtkVTK_ShapeData()
-        shape_mesher = IVtkOCC_ShapeMesher()
-
-        drawer = vtk_shape.Attributes()
-        drawer.SetUIsoAspect(Prs3d_IsoAspect(Quantity_Color(), Aspect_TOL_SOLID, 1, 0))
-        drawer.SetVIsoAspect(Prs3d_IsoAspect(Quantity_Color(), Aspect_TOL_SOLID, 1, 0))
-
-        if tolerance:
-            drawer.SetDeviationCoefficient(tolerance)
-
-        if angular_tolerance:
-            drawer.SetDeviationAngle(angular_tolerance)
-
-        shape_mesher.Build(vtk_shape, shape_data)
-
-        vtk_poly_data = shape_data.getVtkPolyData()
-
-        # convert to triangles and split edges
-        t_filter = vtkTriangleFilter()
-        t_filter.SetInputData(vtk_poly_data)
-        t_filter.Update()
-
-        return_value = t_filter.GetOutput()
-
-        # compute normals
-        if normals:
-            n_filter = vtkPolyDataNormals()
-            n_filter.SetComputePointNormals(True)
-            n_filter.SetComputeCellNormals(True)
-            n_filter.SetFeatureAngle(360)
-            n_filter.SetInputData(return_value)
-            n_filter.Update()
-
-            return_value = n_filter.GetOutput()
-
-        return return_value
-
     def transform_geometry(self, t_matrix: Matrix) -> Self:
         """Apply affine transform
 
@@ -2117,12 +2191,12 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         return (vertices, edges)
 
-    def _repr_javascript_(self):
+    def _repr_html_(self):
         """Jupyter 3D representation support"""
 
-        from build123d.jupyter_tools import display
+        from build123d.jupyter_tools import shape_to_html
 
-        return display(self)._repr_javascript_()
+        return shape_to_html(self)._repr_html_()
 
 
 class Comparable(ABC):
@@ -2351,7 +2425,7 @@ class ShapeList(list[T]):
 
     def filter_by(
         self,
-        filter_by: ShapePredicate | Axis | Plane | GeomType,
+        filter_by: ShapePredicate | Axis | Plane | GeomType | property,
         reverse: bool = False,
         tolerance: float = 1e-5,
     ) -> ShapeList[T]:
@@ -2446,6 +2520,11 @@ class ShapeList(list[T]):
         # convert input to callable predicate
         if callable(filter_by):
             predicate = filter_by
+        elif isinstance(filter_by, property):
+
+            def predicate(obj):
+                return filter_by.__get__(obj)
+
         elif isinstance(filter_by, Axis):
             predicate = axis_parallel_predicate(filter_by, tolerance=tolerance)
         elif isinstance(filter_by, Plane):
@@ -2524,7 +2603,9 @@ class ShapeList(list[T]):
 
     def group_by(
         self,
-        group_by: Callable[[Shape], K] | Axis | Edge | Wire | SortBy = Axis.Z,
+        group_by: (
+            Callable[[Shape], K] | Axis | Edge | Wire | SortBy | property
+        ) = Axis.Z,
         reverse=False,
         tol_digits=6,
     ) -> GroupBy[T, K]:
@@ -2594,6 +2675,9 @@ class ShapeList(list[T]):
         elif callable(group_by):
             key_f = group_by
 
+        elif isinstance(group_by, property):
+            key_f = group_by.__get__
+
         else:
             raise ValueError(f"Unsupported group_by function: {group_by}")
 
@@ -2624,7 +2708,9 @@ class ShapeList(list[T]):
         return ShapeList([s for shape in self for s in shape.solids()])  # type: ignore
 
     def sort_by(
-        self, sort_by: Axis | Edge | Wire | SortBy = Axis.Z, reverse: bool = False
+        self,
+        sort_by: Axis | Callable[[T], K] | Edge | Wire | SortBy | property = Axis.Z,
+        reverse: bool = False,
     ) -> ShapeList[T]:
         """sort by
 
@@ -2632,14 +2718,27 @@ class ShapeList(list[T]):
         objects.
 
         Args:
-            sort_by (SortBy, optional): sort criteria. Defaults to SortBy.Z.
+            sort_by (Axis | Callable[[T], K] | Edge | Wire | SortBy, optional): sort criteria.
+               Defaults to Axis.Z.
             reverse (bool, optional): flip order of sort. Defaults to False.
+
+        Raises:
+            ValueError: Cannot sort by an empty axis
+            ValueError: Cannot sort by an empty object
+            ValueError: Invalid sort_by criteria provided
 
         Returns:
             ShapeList: sorted list of objects
         """
 
-        if isinstance(sort_by, Axis):
+        if callable(sort_by):
+            # If a callable is provided, use it directly as the key
+            objects = sorted(self, key=sort_by, reverse=reverse)
+
+        elif isinstance(sort_by, property):
+            objects = sorted(self, key=sort_by.__get__, reverse=reverse)
+
+        elif isinstance(sort_by, Axis):
             if sort_by.wrapped is None:
                 raise ValueError("Cannot sort by an empty axis")
             assert sort_by.location is not None
@@ -2702,6 +2801,8 @@ class ShapeList(list[T]):
                     key=lambda obj: obj.volume,  # type: ignore
                     reverse=reverse,
                 )
+        else:
+            raise ValueError("Invalid sort_by criteria provided")
 
         return ShapeList(objects)
 

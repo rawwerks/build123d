@@ -35,14 +35,15 @@ from __future__ import annotations
 #   too-many-arguments, too-many-locals, too-many-public-methods,
 #   too-many-statements, too-many-instance-attributes, too-many-branches
 import copy as copy_module
+import itertools
 import json
 import logging
 import numpy as np
-
-from math import degrees, pi, radians
-from typing import Any, overload, TypeAlias, TYPE_CHECKING
+import warnings
 
 from collections.abc import Iterable, Sequence
+from math import degrees, pi, radians, isclose
+from typing import Any, overload, TypeAlias, TYPE_CHECKING
 
 import OCP.TopAbs as TopAbs_ShapeEnum
 
@@ -558,17 +559,17 @@ class AxisMeta(type):
     @property
     def X(cls) -> Axis:
         """X Axis"""
-        return Axis((0, 0, 0), (1, 0, 0))
+        return cls((0, 0, 0), (1, 0, 0))
 
     @property
     def Y(cls) -> Axis:
         """Y Axis"""
-        return Axis((0, 0, 0), (0, 1, 0))
+        return cls((0, 0, 0), (0, 1, 0))
 
     @property
     def Z(cls) -> Axis:
         """Z Axis"""
-        return Axis((0, 0, 0), (0, 0, 1))
+        return cls((0, 0, 0), (0, 0, 1))
 
 
 class Axis(metaclass=AxisMeta):
@@ -660,16 +661,21 @@ class Axis(metaclass=AxisMeta):
                 gp_Dir(*tuple(direction_vector.normalized())),
             )
 
-        self.position = Vector(
-            self.wrapped.Location().X(),
-            self.wrapped.Location().Y(),
-            self.wrapped.Location().Z(),
-        )  #: Axis origin
-        self.direction = Vector(
-            self.wrapped.Direction().X(),
-            self.wrapped.Direction().Y(),
-            self.wrapped.Direction().Z(),
-        )  #: Axis direction
+    @property
+    def position(self):
+        return Vector(self.wrapped.Location())
+
+    @position.setter
+    def position(self, position: VectorLike):
+        self.wrapped.SetLocation(Vector(position).to_pnt())
+
+    @property
+    def direction(self):
+        return Vector(self.wrapped.Direction())
+
+    @direction.setter
+    def direction(self, direction: VectorLike):
+        self.wrapped.SetDirection(Vector(direction).to_dir())
 
     @property
     def location(self) -> Location:
@@ -690,7 +696,7 @@ class Axis(metaclass=AxisMeta):
 
     def __str__(self) -> str:
         """Display self"""
-        return f"Axis: ({self.position.to_tuple()},{self.direction.to_tuple()})"
+        return f"{type(self).__name__}: ({self.position.to_tuple()},{self.direction.to_tuple()})"
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Axis):
@@ -780,6 +786,43 @@ class Axis(metaclass=AxisMeta):
         """
         return self.wrapped.IsParallel(other.wrapped, angular_tolerance * (pi / 180))
 
+    def is_skew(self, other: Axis, tolerance: float = 1e-5) -> bool:
+        """are axes skew
+
+        Returns True if this axis and another axis are skew, meaning they are neither
+        parallel nor coplanar. Two axes are skew if they do not lie in the same plane
+        and never intersect.
+
+        Mathematically, this means:
+        - The axes are **not parallel** (the cross product of their direction vectors
+          is nonzero).
+        - The axes are **not coplanar** (the vector between their positions is not
+          aligned with the plane spanned by their directions).
+
+        If either condition is false (i.e., the axes are parallel or coplanar), they are
+        not skew.
+
+        Args:
+            other (Axis): axis to compare to
+            tolerance (float, optional): max deviation. Defaults to 1e-5.
+
+        Returns:
+            bool: axes are skew
+        """
+        if self.is_parallel(other, tolerance):
+            # If parallel, check if they are coincident
+            parallel_offset = (self.position - other.position).cross(self.direction)
+            # True if distinct, False if coincident
+            return parallel_offset.length > tolerance
+
+        # Compute the determinant
+        coplanarity = (self.position - other.position).dot(
+            self.direction.cross(other.direction)
+        )
+
+        # If determinant is near zero, they are coplanar; otherwise, they are skew
+        return abs(coplanarity) > tolerance
+
     def angle_between(self, other: Axis) -> float:
         """calculate angle between axes
 
@@ -796,7 +839,7 @@ class Axis(metaclass=AxisMeta):
 
     def reverse(self) -> Axis:
         """Return a copy of self with the direction reversed"""
-        return Axis(self.wrapped.Reversed())
+        return type(self)(self.wrapped.Reversed())
 
     def __neg__(self) -> Axis:
         """Flip direction operator -"""
@@ -830,37 +873,29 @@ class Axis(metaclass=AxisMeta):
         if axis is not None:
             if self.is_coaxial(axis):
                 return self
-            else:
-                # Extract points and directions to numpy arrays
-                p1 = np.array([*self.position])
-                d1 = np.array([*self.direction])
-                p2 = np.array([*axis.position])
-                d2 = np.array([*axis.direction])
 
-                # Compute the cross product of directions
-                cross_d1_d2 = np.cross(d1, d2)
-                cross_d1_d2_norm = np.linalg.norm(cross_d1_d2)
+            if self.is_skew(axis):
+                return None
 
-                if cross_d1_d2_norm < TOLERANCE:
-                    # The directions are parallel
-                    return None
+            # Extract points and directions to numpy arrays
+            p1 = np.array([*self.position])
+            d1 = np.array([*self.direction])
+            p2 = np.array([*axis.position])
+            d2 = np.array([*axis.direction])
 
-                # Solve the system of equations to find the intersection
-                system_of_equations = np.array([d1, -d2, cross_d1_d2]).T
-                origin_diff = p2 - p1
-                try:
-                    t1, t2, _ = np.linalg.solve(system_of_equations, origin_diff)
-                except np.linalg.LinAlgError:
-                    return None  # The lines do not intersect
+            # Solve the system of equations to find the intersection
+            system_of_equations = np.array([d1, -d2, np.cross(d1, d2)]).T
+            origin_diff = p2 - p1
+            t1, t2, _ = np.linalg.lstsq(system_of_equations, origin_diff, rcond=None)[0]
 
-                # Calculate the intersection point
-                intersection_point = p1 + t1 * d1
-                return Vector(*intersection_point)
+            # Calculate the intersection point
+            intersection_point = p1 + t1 * d1
+            return Vector(*intersection_point)
 
-        elif plane is not None:
+        if plane is not None:
             return plane.intersect(self)
 
-        elif vector is not None:
+        if vector is not None:
             # Create a vector from the origin to the point
             vec_to_point = vector - self.position
 
@@ -872,7 +907,7 @@ class Axis(metaclass=AxisMeta):
             if vector == projected_vec:
                 return vector
 
-        elif location is not None:
+        if location is not None:
             # Find the "direction" of the location
             location_dir = Plane(location).z_dir
 
@@ -883,7 +918,7 @@ class Axis(metaclass=AxisMeta):
             ):
                 return location
 
-        elif shape is not None:
+        if shape is not None:
             return shape.intersect(self)
 
 
@@ -1105,11 +1140,11 @@ class Color:
 
     @overload
     def __init__(self, color_code: int, alpha: int = 0xFF):
-        """Color from a hexidecimal color code with an optional alpha value
+        """Color from a hexadecimal color code with an optional alpha value
 
         Args:
-            color_code (hexidecimal int): 0xRRGGBB
-            alpha (hexidecimal int): 0x00 <= alpha as hex <= 0xFF
+            color_code (hexadecimal int): 0xRRGGBB
+            alpha (hexadecimal int): 0x00 <= alpha as hex <= 0xFF
         """
 
     def __init__(self, *args, **kwargs):
@@ -1215,6 +1250,68 @@ class Color:
     def __repr__(self) -> str:
         """Color repr"""
         return f"Color{str(tuple(self))}"
+
+
+class GeomEncoder(json.JSONEncoder):
+    """
+    A JSON encoder for build123d geometry objects.
+
+    This class extends ``json.JSONEncoder`` to provide custom serialization for
+    geometry objects such as Axis, Color, Location, Plane, and Vector. It converts
+    each geometry object into a dictionary containing exactly one key that identifies
+    the geometry type (e.g. ``"Axis"``, ``"Vector"``, etc.), paired with a tuple or
+    list that represents the underlying data. Any other object types are handled by
+    the standard encoder.
+
+    The inverse decoding is performed by the ``geometry_hook`` static method, which
+    expects the dictionary to have precisely one key from the known geometry types.
+    It then uses a class registry (``CLASS_REGISTRY``) to look up and instantiate
+    the appropriate class with the provided values.
+
+    **Usage Example**::
+
+        import json
+
+        # Suppose we have some geometry objects:
+        axis = Axis(position=(0, 0, 0), direction=(1, 0, 0))
+        vector = Vector(0.0, 1.0, 2.0)
+
+        data = {
+            "my_axis": axis,
+            "my_vector": vector
+        }
+
+        # Encode them to JSON:
+        encoded_data = json.dumps(data, cls=GeomEncoder, indent=4)
+
+        # Decode them back:
+        decoded_data = json.loads(encoded_data, object_hook=GeomEncoder.geometry_hook)
+
+    """
+
+    def default(self, obj):
+        """Return a JSON-serializable representation of a known geometry object."""
+        if isinstance(obj, Axis):
+            return {"Axis": (tuple(obj.position), tuple(obj.direction))}
+        elif isinstance(obj, Color):
+            return {"Color": obj.to_tuple()}
+        if isinstance(obj, Location):
+            return {"Location": obj.to_tuple()}
+        elif isinstance(obj, Plane):
+            return {"Plane": (tuple(obj.origin), tuple(obj.x_dir), tuple(obj.z_dir))}
+        elif isinstance(obj, Vector):
+            return {"Vector": tuple(obj)}
+        else:
+            # Let the base class default method raise the TypeError
+            return super().default(obj)
+
+    @staticmethod
+    def geometry_hook(json_dict):
+        """Convert dictionaries back into geometry objects for decoding."""
+        if len(json_dict.items()) != 1:
+            raise ValueError(f"Invalid geometry json object {json_dict}")
+        for key, value in json_dict.items():
+            return CLASS_REGISTRY[key](*value)
 
 
 class Location:
@@ -1679,6 +1776,7 @@ class LocationEncoder(json.JSONEncoder):
 
     def default(self, o: Location) -> dict:
         """Return a serializable object"""
+        warnings.warn("Use GeomEncoder instead", DeprecationWarning, stacklevel=2)
         if not isinstance(o, Location):
             raise TypeError("Only applies to Location objects")
         return {"Location": o.to_tuple()}
@@ -1690,9 +1788,219 @@ class LocationEncoder(json.JSONEncoder):
         Example:
             read_json = json.load(infile, object_hook=LocationEncoder.location_hook)
         """
+        warnings.warn("Use GeomEncoder instead", DeprecationWarning, stacklevel=2)
         if "Location" in obj:
             obj = Location(*[[float(f) for f in v] for v in obj["Location"]])
         return obj
+
+
+class OrientedBoundBox:
+    """
+    An Oriented Bounding Box
+
+    This class computes the oriented bounding box for a given build123d shape.
+    It exposes properties such as the center, principal axis directions, the
+    extents along these axes, and the full diagonal length of the box.
+
+    Note: The axes of the oriented bounding box are arbitrary and may not be
+    consistent across platforms or time.
+    """
+
+    def __init__(self, shape: Bnd_OBB | Shape):
+        """
+        Create an oriented bounding box from either a precomputed Bnd_OBB or
+        a build123d Shape (which wraps a TopoDS_Shape).
+
+        Args:
+            shape (Bnd_OBB | Shape): Either a precomputed Bnd_OBB or a build123d shape
+                from which to compute the oriented bounding box.
+        """
+        if isinstance(shape, Bnd_OBB):
+            obb = shape
+        else:
+            obb = Bnd_OBB()
+            # Compute the oriented bounding box for the shape.
+            BRepBndLib.AddOBB_s(shape.wrapped, obb, True)
+        self.wrapped = obb
+
+    @property
+    def corners(self) -> list[Vector]:
+        """
+        Compute and return the unique corner points of the oriented bounding box
+        in the coordinate system defined by the OBB's plane.
+
+        For degenerate shapes (e.g. a line or a planar face), only the unique
+        points are returned. For 2D shapes the corners are returned in an order
+        that allows a polygon to be directly created from them.
+
+        Returns:
+            list[Vector]: The unique corner points.
+        """
+
+        # Build a dictionary keyed by a tuple indicating if each axis is degenerate.
+        orders = {
+            # Straight line cases
+            (True, True, False): [(1, 1, 1), (1, 1, -1)],
+            (True, False, True): [(1, 1, 1), (1, -1, 1)],
+            (False, True, True): [(1, 1, 1), (-1, 1, 1)],
+            # Planar face cases
+            (True, False, False): [(1, 1, 1), (1, 1, -1), (1, -1, -1), (1, -1, 1)],
+            (False, True, False): [(1, 1, 1), (1, 1, -1), (-1, 1, -1), (-1, 1, 1)],
+            (False, False, True): [(1, 1, 1), (1, -1, 1), (-1, -1, 1), (-1, 1, 1)],
+            # 3D object case
+            (False, False, False): [
+                (x, y, z) for x, y, z in itertools.product((-1, 1), (-1, 1), (-1, 1))
+            ],
+        }
+        hs = self.size * 0.5
+        order = orders[(hs.X < TOLERANCE, hs.Y < TOLERANCE, hs.Z < TOLERANCE)]
+        local_corners = [
+            Vector(sx * hs.X, sy * hs.Y, sz * hs.Z) for sx, sy, sz in order
+        ]
+        corners = [self.plane.from_local_coords(c) for c in local_corners]
+
+        return corners
+
+    @property
+    def diagonal(self) -> float:
+        """
+        The full length of the body diagonal of the oriented bounding box,
+        which represents the maximum size of the object.
+
+        Returns:
+            float: The diagonal length.
+        """
+        if self.wrapped is None:
+            return 0.0
+        return self.wrapped.SquareExtent() ** 0.5
+
+    @property
+    def location(self) -> Location:
+        """
+        The Location of the center of the oriented bounding box.
+
+        Returns:
+            Location: center location
+        """
+        return Location(self.plane)
+
+    @property
+    def plane(self) -> Plane:
+        """
+        The oriented coordinate system of the bounding box.
+
+        Returns:
+            Plane: The coordinate system defined by the center and primary
+                   (X) and tertiary (Z) directions of the bounding box.
+        """
+        return Plane(
+            origin=self.center(), x_dir=self.x_direction, z_dir=self.z_direction
+        )
+
+    @property
+    def size(self) -> Vector:
+        """
+        The full extents of the bounding box along its primary axes.
+
+        Returns:
+            Vector: The oriented size (full dimensions) of the box.
+        """
+        return (
+            Vector(self.wrapped.XHSize(), self.wrapped.YHSize(), self.wrapped.ZHSize())
+            * 2.0
+        )
+
+    @property
+    def x_direction(self) -> Vector:
+        """
+        The primary (X) direction of the oriented bounding box.
+
+        Returns:
+            Vector: The X direction as a unit vector.
+        """
+        x_direction_xyz = self.wrapped.XDirection()
+        coords = [getattr(x_direction_xyz, attr)() for attr in ("X", "Y", "Z")]
+        return Vector(*coords)
+
+    @property
+    def y_direction(self) -> Vector:
+        """
+        The secondary (Y) direction of the oriented bounding box.
+
+        Returns:
+            Vector: The Y direction as a unit vector.
+        """
+        y_direction_xyz = self.wrapped.YDirection()
+        coords = [getattr(y_direction_xyz, attr)() for attr in ("X", "Y", "Z")]
+        return Vector(*coords)
+
+    @property
+    def z_direction(self) -> Vector:
+        """
+        The tertiary (Z) direction of the oriented bounding box.
+
+        Returns:
+            Vector: The Z direction as a unit vector.
+        """
+        z_direction_xyz = self.wrapped.ZDirection()
+        coords = [getattr(z_direction_xyz, attr)() for attr in ("X", "Y", "Z")]
+        return Vector(*coords)
+
+    def center(self) -> Vector:
+        """
+        Compute and return the center point of the oriented bounding box.
+
+        Returns:
+            Vector: The center point of the box.
+        """
+        center_xyz = self.wrapped.Center()
+        coords = [getattr(center_xyz, attr)() for attr in ("X", "Y", "Z")]
+        return Vector(*coords)
+
+    def is_completely_inside(self, other: OrientedBoundBox) -> bool:
+        """
+        Determine whether the given oriented bounding box is entirely contained
+        within this bounding box.
+
+        This method checks that every point of 'other' lies strictly within the
+        boundaries of this box, according to the tolerance criteria inherent to the
+        underlying OCCT implementation.
+
+        Args:
+            other (OrientedBoundBox): The bounding box to test for containment.
+
+        Raises:
+            ValueError: If the 'other' bounding box has an uninitialized (null) underlying geometry.
+
+        Returns:
+            bool: True if 'other' is completely inside this bounding box; otherwise, False.
+        """
+        if other.wrapped is None:
+            raise ValueError("Can't compare to a null obb")
+        return self.wrapped.IsCompletelyInside(other.wrapped)
+
+    def is_outside(self, point: Vector) -> bool:
+        """
+        Determine whether a given point lies entirely outside this oriented bounding box.
+
+        A point is considered outside if it is neither inside the box nor on its surface,
+        based on the criteria defined by the OCCT implementation.
+
+        Args:
+            point (Vector): The point to test.
+
+        Raises:
+            ValueError: If the point's underlying geometry is not set (null).
+
+        Returns:
+            bool: True if the point is completely outside the bounding box; otherwise, False.
+        """
+        if point.wrapped is None:
+            raise ValueError("Can't compare to a null point")
+        return self.wrapped.IsOut(point.to_pnt())
+
+    def __repr__(self) -> str:
+        return f"OrientedBoundBox(center={self.center()}, size={self.size}, plane={self.plane})"
 
 
 class Rotation(Location):
@@ -2644,6 +2952,15 @@ class Plane(metaclass=PlaneMeta):
 
         if shape is not None:
             return shape.intersect(self)
+
+
+CLASS_REGISTRY = {
+    "Axis": Axis,
+    "Color": Color,
+    "Location": Location,
+    "Plane": Plane,
+    "Vector": Vector,
+}
 
 
 def to_align_offset(

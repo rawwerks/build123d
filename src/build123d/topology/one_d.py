@@ -66,7 +66,11 @@ from scipy.spatial import ConvexHull
 import OCP.TopAbs as ta
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_CompCurve, BRepAdaptor_Curve
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Splitter
+from OCP.BRepAlgoAPI import (
+    BRepAlgoAPI_Common,
+    BRepAlgoAPI_Section,
+    BRepAlgoAPI_Splitter,
+)
 from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_DisconnectedWire,
     BRepBuilderAPI_EmptyWire,
@@ -80,10 +84,11 @@ from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet2d
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
 from OCP.BRepLib import BRepLib, BRepLib_FindSurface
+from OCP.BRepOffset import BRepOffset_MakeOffset
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffset
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeHalfSpace
 from OCP.BRepProj import BRepProj_Projection
-from OCP.BRepTools import BRepTools
+from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
 from OCP.GC import GC_MakeArcOfCircle, GC_MakeArcOfEllipse
 from OCP.GCPnts import GCPnts_AbscissaPoint
 from OCP.GProp import GProp_GProps
@@ -134,6 +139,7 @@ from OCP.TopoDS import (
     TopoDS,
     TopoDS_Compound,
     TopoDS_Edge,
+    TopoDS_Face,
     TopoDS_Shape,
     TopoDS_Shell,
     TopoDS_Wire,
@@ -222,6 +228,34 @@ class Mixin1D(Shape):
         if self.wrapped is None:
             raise ValueError("Can't determine direction of empty Edge or Wire")
         return self.wrapped.Orientation() == TopAbs_Orientation.TopAbs_FORWARD
+
+    @property
+    def is_interior(self) -> bool:
+        """
+        Check if the edge is an interior edge.
+
+        An interior edge lies between surfaces that are part of the body (internal
+        to the geometry) and does not form part of the exterior boundary.
+
+        Returns:
+            bool: True if the edge is an interior edge, False otherwise.
+        """
+        # Find the faces connected to this edge and offset them
+        topods_face_pair = topo_explore_connected_faces(self)
+        offset_face_pair = [
+            offset_topods_face(f, self.length / 100) for f in topods_face_pair
+        ]
+
+        # Intersect the offset faces
+        sectionor = BRepAlgoAPI_Section(
+            offset_face_pair[0], offset_face_pair[1], PerformNow=False
+        )
+        sectionor.Build()
+        face_intersection_result = sectionor.Shape()
+
+        # If an edge was created the faces intersect and the edge is interior
+        explorer = TopExp_Explorer(face_intersection_result, ta.TopAbs_EDGE)
+        return explorer.More()
 
     @property
     def length(self) -> float:
@@ -446,10 +480,20 @@ class Mixin1D(Shape):
 
     def edges(self) -> ShapeList[Edge]:
         """edges - all the edges in this Shape"""
-        edge_list = Shape.get_shape_list(self, "Edge")
-        return edge_list.filter_by(
-            lambda e: BRep_Tool.Degenerated_s(e.wrapped), reverse=True
-        )
+        if isinstance(self, Wire):
+            # The WireExplorer is a tool to explore the edges of a wire in a connection order.
+            explorer = BRepTools_WireExplorer(self.wrapped)
+
+            edge_list: ShapeList[Edge] = ShapeList()
+            while explorer.More():
+                edge_list.append(Edge(explorer.Current()))
+                explorer.Next()
+            return edge_list
+        else:
+            edge_list = Shape.get_shape_list(self, "Edge")
+            return edge_list.filter_by(
+                lambda e: BRep_Tool.Degenerated_s(e.wrapped), reverse=True
+            )
 
     def end_point(self) -> Vector:
         """The end point of this edge.
@@ -899,6 +943,10 @@ class Mixin1D(Shape):
         """split and keep inside or outside"""
 
     @overload
+    def split(self, tool: TrimmingTool, keep: Literal[Keep.ALL]) -> list[Self]:
+        """split and return the unordered pieces"""
+
+    @overload
     def split(self, tool: TrimmingTool, keep: Literal[Keep.BOTH]) -> tuple[
         Self | list[Self] | None,
         Self | list[Self] | None,
@@ -957,6 +1005,14 @@ class Mixin1D(Shape):
         # Remove unnecessary TopoDS_Compound around single shape
         if isinstance(split_result, TopoDS_Compound):
             split_result = unwrap_topods_compound(split_result, True)
+
+        # For speed the user may just want all the objects which they
+        # can sort more efficiently then the generic algorithm below
+        if keep == Keep.ALL:
+            return ShapeList(
+                self.__class__.cast(part)
+                for part in get_top_level_topods_shapes(split_result)
+            )
 
         if not isinstance(tool, Plane):
             # Get a TopoDS_Face to work with from the tool
@@ -2992,6 +3048,15 @@ def edges_to_wires(edges: Iterable[Edge], tol: float = 1e-6) -> ShapeList[Wire]:
     return wires
 
 
+def offset_topods_face(face: TopoDS_Face, amount: float) -> TopoDS_Shape:
+    """Offset a topods_face"""
+    offsetor = BRepOffset_MakeOffset()
+    offsetor.Initialize(face, Offset=amount, Tol=TOLERANCE)
+    offsetor.MakeOffsetShape()
+
+    return offsetor.Shape()
+
+
 def topo_explore_connected_edges(
     edge: Edge, parent: Shape | None = None
 ) -> ShapeList[Edge]:
@@ -3017,3 +3082,31 @@ def topo_explore_connected_edges(
             connected_edges.add(topods_edge)
 
     return ShapeList(Edge(e) for e in connected_edges)
+
+
+def topo_explore_connected_faces(
+    edge: Edge, parent: Shape | None = None
+) -> list[TopoDS_Face]:
+    """Given an edge extracted from a Shape, return the topods_faces connected to it"""
+
+    parent = parent if parent is not None else edge.topo_parent
+    if parent is None:
+        raise ValueError("edge has no valid parent")
+
+    # make a edge --> faces mapping
+    edge_face_map = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(
+        parent.wrapped, ta.TopAbs_EDGE, ta.TopAbs_FACE, edge_face_map
+    )
+
+    # Query the map
+    faces = []
+    if edge_face_map.Contains(edge.wrapped):
+        face_list = edge_face_map.FindFromKey(edge.wrapped)
+        for face in face_list:
+            faces.append(TopoDS.Face_s(face))
+
+    if len(faces) != 2:
+        raise RuntimeError("Invalid # of faces connected to this edge")
+
+    return faces

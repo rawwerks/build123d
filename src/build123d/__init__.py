@@ -28,6 +28,7 @@ modify_copyreg()
 
 __all__ = [
     # Length Constants
+    "MC",
     "MM",
     "CM",
     "M",
@@ -126,6 +127,7 @@ __all__ = [
     "Wedge",
     # Direct API Classes
     "BoundBox",
+    "OrientedBoundBox",
     "Rotation",
     "Rot",
     "Pos",
@@ -148,6 +150,7 @@ __all__ = [
     "Compound",
     "Location",
     "LocationEncoder",
+    "GeomEncoder",
     "Joint",
     "RigidJoint",
     "RevoluteJoint",
